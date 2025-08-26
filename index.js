@@ -11,77 +11,128 @@ app.use(express.json());
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// Health check
+/* ---------- helpers ---------- */
+
+function norm(t = "") {
+  return String(t).toLowerCase().trim();
+}
+
+function stripGreeting(text = "") {
+  // quita “Hola ...” al inicio si aparece
+  return text.replace(/^\s*hola[!.,\s-:]*/i, "").trim();
+}
+
+function extractJson(text = "") {
+  // Devuelve el primer bloque JSON válido que encuentre en el contenido
+  if (!text) return null;
+  // 1) intento directo
+  try {
+    return JSON.parse(text);
+  } catch {}
+  // 2) buscar el primer {...} parseable
+  const match = text.match(/\{[\s\S]*\}/);
+  if (match) {
+    try {
+      return JSON.parse(match[0]);
+    } catch {}
+  }
+  return null;
+}
+
+/* ---------- health check ---------- */
 app.get("/", (_req, res) => res.send("remy-ai-backend up"));
 
+/* ---------- main endpoint ---------- */
 app.post("/recommendation", async (req, res) => {
-  const { message, username = "", manychat_user_id = "" } = req.body || {};
+  const {
+    message,
+    username = "",
+    manychat_user_id = "",
+    city = "",
+    area = "",
+    budget = "",
+    preferences = "",
+  } = req.body || {};
+
+  if (!message || !String(message).trim()) {
+    return res.status(400).json({ error: "Missing 'message' in body" });
+  }
 
   try {
     const completion = await openai.chat.completions.create({
       model: "gpt-4",
-      temperature: 0.7,
+      temperature: 0.3, // menos creatividad, más foco
       messages: [
         {
           role: "system",
-          content: `Eres Remy, experto en restaurantes del mundo.
-Responde SIEMPRE en el mismo idioma del usuario.
-Devuelve SOLO JSON válido con este esquema:
+          content: `
+Eres **Remy**, experto en restaurantes.
+
+Reglas de oro:
+- Responde SIEMPRE en el idioma del usuario.
+- No repitas literalmente lo que dijo el usuario ni saludes más de una vez por conversación.
+- Si no hay ciudad o zona, PREGUNTA primero por ciudad/colonia antes de recomendar.
+- No sugieras lugares de otra ciudad/país a menos que el usuario lo pida explícitamente.
+- Pide SOLO una aclaración por turno (zona o presupuesto o tipo de cocina).
+- Cuando des opciones, ofrece 2–3 alternativas en la zona del usuario, con: barrio/colonia, por qué vale la pena, y rango de precio ($, $$, $$$).
+- Si no tienes data fiable de un lugar específico, no inventes datos: sugiere zonas/tipos y pide permiso para afinar.
+- Devuelve SOLO JSON válido con este esquema:
 {
-  "reply": "<texto para enviar al usuario>",
-  "followup": "<pregunta breve para continuar la conversación>"
+  "reply": "<mensaje para el usuario (máx. 3–5 frases, claro y directo)>",
+  "followup": "<UNA pregunta breve y específica para avanzar>"
 }
-No añadas texto fuera del JSON.`,
+          `.trim(),
         },
         {
           role: "user",
-          content: `Usuario: ${username}
-ManyChatID: ${manychat_user_id}
-Mensaje: ${message}`,
+          content: `
+Contexto de ManyChat (si existe):
+- Usuario: ${username || ""}
+- ManyChatID: ${manychat_user_id || ""}
+- Ciudad: ${city || ""}
+- Zona/Colonia: ${area || ""}
+- Presupuesto: ${budget || ""}
+- Preferencias: ${preferences || ""}
+
+Mensaje del usuario: ${message}
+          `.trim(),
         },
       ],
     });
 
-    let content = completion.choices?.[0]?.message?.content?.trim() || "";
-    let reply = "";
-    let followup = "";
+    const content =
+      completion.choices?.[0]?.message?.content?.trim() || "";
 
-    // Intenta parsear JSON directo
-    try {
-      const parsed = JSON.parse(content);
-      reply = parsed.reply;
-      followup = parsed.followup;
-    } catch {
-      // Si vino texto con JSON embebido, lo extraemos
-      const match = content.match(/\{[\s\S]*\}/);
-      if (match) {
-        try {
-          const parsed = JSON.parse(match[0]);
-          reply = parsed.reply;
-          followup = parsed.followup;
-        } catch {}
-      }
-    }
+    // Intentar parsear el JSON que devuelve el modelo
+    const parsed = extractJson(content) || {};
+    let reply = parsed.reply || "";
+    let followup = parsed.followup || "";
 
-    // Fallbacks por si el modelo no respetó el formato
-    if (!reply) {
+    // Limpiezas y barandales anti-eco
+    reply = stripGreeting(reply);
+    if (!reply || norm(reply) === norm(message)) {
       reply =
-        content ||
-        "Puedo sugerirte lugares en CDMX según tu antojo, zona y presupuesto. ¿Qué se te antoja?";
+        "Puedo recomendarte lugares según zona y presupuesto. ¿En qué colonia estás o qué zona te queda mejor?";
     }
     if (!followup) {
-      followup = "¿Quieres otra opción, cambiar de zona o ajustar presupuesto?";
+      followup = "¿En qué colonia estás (por ejemplo: Polanco, Roma o Condesa)?";
     }
+
+    // Seguridad: respuesta concisa (evita paredes de texto)
+    // (opcional) recorta a unas ~700 chars por si acaso
+    if (reply.length > 700) reply = reply.slice(0, 700) + "…";
 
     return res.json({ reply, followup });
   } catch (err) {
-    console.error(err);
+    console.error("OpenAI error:", err?.response?.data || err);
     return res.status(500).json({ error: "Error generating recommendation" });
   }
 });
 
+/* ---------- server ---------- */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Servidor corriendo en puerto ${PORT}`);
 });
+
 
