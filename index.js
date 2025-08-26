@@ -12,15 +12,11 @@ app.use(express.json());
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-/**
- * Memoria de sesión simple en memoria del servidor.
- * Clave: manychat_user_id
- * Guarda: historial corto + "slots" (ciudad, zona, cocina, presupuesto) + timestamp
- * Nota: es suficiente para prototipos; en producción usa Redis/DB.
- */
+/* ------- Memoria en servidor (prototipo) ------- */
 const SESSIONS = new Map();
-const TTL_MS = 1000 * 60 * 60 * 4; // 4 horas de inactividad
-const MAX_TURNS = 8;               // últimos N turnos (usuario+asistente)
+const TTL_MS = 1000 * 60 * 60 * 4; // 4 h
+const MAX_TURNS = 8;
+const RESET_REGEX = /\b(olvida|borra|reinicia|reset|emp(e|ie)cemos de cero|start over)\b/i;
 
 function getSession(userId) {
   const now = Date.now();
@@ -32,20 +28,25 @@ function getSession(userId) {
   s.lastActive = now;
   return s;
 }
-
 function pushHistory(session, role, content) {
   session.history.push({ role, content });
-  // recorta para mantener sólo los últimos MAX_TURNS*2 mensajes aprox.
   const maxMsgs = MAX_TURNS * 2;
   if (session.history.length > maxMsgs) {
-    session.history = session.history.slice(session.history.length - maxMsgs);
+    session.history = session.history.slice(-maxMsgs);
   }
 }
+function mergeSlots(prev, incoming = {}) {
+  const next = { ...prev };
+  for (const k of ["city", "area", "cuisine", "budget_mxn"]) {
+    const v = incoming[k];
+    if (v !== undefined && v !== null && String(v).trim() !== "") {
+      next[k] = String(v).trim();
+    }
+  }
+  return next;
+}
 
-/**
- * Une mensajes para el modelo: system + historial + mensaje actual.
- * Además le inyectamos el "estado" (slots) para que NO pregunte lo ya conocido.
- */
+/* ------- Mensajes para el modelo ------- */
 function buildMessages(session, username, incomingText) {
   const stateNote = [
     session.slots.city ? `• Ciudad/municipio: ${session.slots.city}` : "",
@@ -57,52 +58,55 @@ function buildMessages(session, username, incomingText) {
   const system = {
     role: "system",
     content: `
-Eres **Remy**, un experto en restaurantes que conversa de forma breve, amable y práctica.
-Reglas IMPORTANTES:
-- Responde SIEMPRE en el mismo idioma del usuario.
-- Usa la información de estado ya conocida; NO repitas preguntas que ya estén en “Estado actual”.
-- Haz preguntas de seguimiento **una por turno** para completar lo que falte (cocina, zona, presupuesto…).
-- Si el usuario ya dio una parte (p.ej. ciudad), confirma y avanza a lo siguiente.
-- Sé local y concreto; 2–4 frases máx. + 1 pregunta de seguimiento.
-- Devuelve **sólo JSON válido** con el siguiente esquema:
+Eres **Remy**, experto en restaurantes. Estilo: breve, amable, útil.
+Reglas CLAVE:
+- Responde SIEMPRE en el idioma del usuario.
+- Usa el “Estado actual” y **no repitas** preguntas ya respondidas.
+- Si el usuario **corrige** (p.ej., cambia la ciudad), **actualiza** el valor.
+- Haz **una** pregunta de seguimiento por turno como máximo.
+- Devuelve **sólo JSON válido** exactamente con este esquema (sin texto extra):
 
 {
   "reply": "<texto para enviar al usuario (incluye tu pregunta de seguimiento al final)>",
   "followup": "<pregunta breve para continuar>",
-  "slots": { "city": "<string|opcional>", "area": "<string|opcional>", "cuisine": "<string|opcional>", "budget_mxn": "<number|string|opcional>" }
+  "slots": {
+    "city": "<string o vacío si no aplica>",
+    "area": "<string o vacío>",
+    "cuisine": "<string o vacío>",
+    "budget_mxn": "<número o string o vacío>"
+  }
 }
 
-No añadas nada fuera del JSON.
+IMPORTANTÍSIMO: **Devuelve SIEMPRE el objeto "slots"** con tu mejor estado actual (aunque sean los mismos valores de antes). Si detectas que el usuario cambió un dato, devuelve el **nuevo** valor en slots.
 
-Estado actual del usuario:
+Estado actual:
 ${stateNote}
-Usuario (ManyChat): ${username || "(desconocido)"}`
+Usuario (ManyChat): ${username || "(desconocido)"}
+`.trim(),
   };
 
-  // Historial curto + nuevo turno
-  const msgs = [system, ...session.history, { role: "user", content: incomingText }];
-  return msgs;
+  return [system, ...session.history, { role: "user", content: incomingText }];
 }
 
-/** Fusiona slots nuevos con los previos (sólo si vienen con valor). */
-function mergeSlots(prev, incoming = {}) {
-  const next = { ...prev };
-  for (const k of ["city", "area", "cuisine", "budget_mxn"]) {
-    const val = incoming[k];
-    if (val !== undefined && val !== null && String(val).trim() !== "") {
-      next[k] = String(val).trim();
-    }
-  }
-  return next;
-}
-
-// Health check
+/* ------- Health ------- */
 app.get("/", (_req, res) => res.send("remy-ai-backend up"));
 
+/* ------- Endpoint principal ------- */
 app.post("/recommendation", async (req, res) => {
   const { message = "", username = "", manychat_user_id = "" } = req.body || {};
   if (!message) return res.status(400).json({ error: "Missing 'message'." });
+
   const userId = manychat_user_id || `anon-${(req.ip || "x").replace(/[:.]/g, "")}`;
+
+  // RESET de conversación si el usuario lo pide
+  if (RESET_REGEX.test(message)) {
+    SESSIONS.delete(userId);
+    return res.json({
+      reply:
+        "¡Listo! Empecemos de cero. Dime en qué ciudad estás y qué se te antoja (por ejemplo, ramen en Celaya).",
+      followup: "¿En qué ciudad estás y qué quieres comer?",
+    });
+  }
 
   const session = getSession(userId);
   pushHistory(session, "user", message);
@@ -111,12 +115,11 @@ app.post("/recommendation", async (req, res) => {
     const messages = buildMessages(session, username, message);
 
     const completion = await openai.chat.completions.create({
-      model: "gpt-4o-mini",            // rápido y barato; puedes subir a gpt-4o o gpt-4.1 si quieres
+      model: "gpt-4o-mini",
       temperature: 0.7,
       messages,
     });
 
-    // El modelo debería devolver puro JSON. De todos modos, parseamos con fallback.
     let raw = completion.choices?.[0]?.message?.content?.trim() || "";
     let data = null;
     try {
@@ -128,45 +131,8 @@ app.post("/recommendation", async (req, res) => {
       }
     }
 
-    // Valores por defecto seguros
     let reply = "";
-    let followup = "";
-    let slots = {};
-    if (data && typeof data === "object") {
-      reply = (data.reply || "").toString();
-      followup = (data.followup || "").toString();
-      slots = data.slots || {};
-    }
-    if (!reply) {
-      reply = "Puedo sugerirte lugares según tu antojo, zona y presupuesto. ¿Qué se te antoja y en qué ciudad estás?";
-    }
-    if (!followup) {
-      followup = "¿Quieres otra opción, cambiar de zona o ajustar presupuesto?";
-    }
+    let follow
 
-    // Actualizamos memoria: slots + historial (guardamos el texto plano del asistente, no el JSON)
-    session.slots = mergeSlots(session.slots, slots);
-    pushHistory(session, "assistant", reply);
-
-    // Opcional: si quieres que el usuario vea la pregunta de seguimiento, la añadimos al final del reply.
-    const replyWithFollowup = followup && !reply.includes(followup)
-      ? `${reply.trim()} ${followup.trim()}`
-      : reply;
-
-    return res.json({
-      reply: replyWithFollowup,
-      followup,        // disponible si luego lo mapeas en ManyChat
-      // slots,        // opcionalmente puedes devolverlos si quieres depurar
-    });
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: "Error generating recommendation" });
-  }
-});
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Servidor corriendo en puerto ${PORT}`);
-});
 
 
