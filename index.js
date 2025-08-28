@@ -1,5 +1,3 @@
-// index.js  — Remy backend con memoria de "slots" y respuesta JSON para ManyChat
-
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
@@ -13,225 +11,194 @@ app.use(express.json());
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// ---------- Utilidades simples de extracción ----------
-const norm = (s = "") => (s || "").toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
+// Utilidades
+const clean = (v) => (typeof v === "string" ? v.trim() : "");
+const isEmpty = (v) => !v || !clean(v);
 
-const KNOWN_CITIES = [
-  "cdmx","ciudad de mexico","mexico city","guadalajara","zapopan","queretaro","santiago de queretaro",
-  "monterrey","san pedro","merida","puebla","tijuana","leon","celaya","ibiza","cordoba","cordoba veracruz",
-  "veracruz","cancun","polanco","roma","condesa"
-];
-
-const KNOWN_ZONES = [
-  "centro","polanco","roma","condesa","del valle","napoles","providencia","chapultepec","oblatos","satelite"
-];
-
-const CUISINES = [
-  "tacos","tacos al pastor","tacos de carnitas","ramen","sushi","pizza","hamburguesas","mariscos","pozole",
-  "cochinita","barbacoa","café","cafe","chilaquiles","cortes","parrilla","alitas","tortas","tlayudas","birria"
-];
-
-function extractBudget(text) {
-  const t = norm(text);
-  // $200, 200 pesos, 200 mxn
-  const m = t.match(/(?:\$|\bmxn?\b\s*)?(\d{2,5})(?:\s*(?:mxn|pesos)?)?/i);
-  return m ? m[1] : "";
+function extractBudget(text = "") {
+  const t = (text || "").toLowerCase();
+  const m =
+    t.match(/\$?\s*([0-9]{2,5})(?:\s*(?:mxn|pesos?)?)\b/) ||
+    t.match(/\b([0-9]{2,5})\s*(?:mxn|pesos?)\b/);
+  if (!m) return "";
+  return m[1];
 }
 
-function extractCity(text) {
-  const t = " " + norm(text) + " ";
-  // después de "en " capturar 1-3 palabras
-  const m = t.match(/\sen\s([a-záéíóúüñ]+(?:\s+[a-záéíóúüñ]+){0,2})\s/);
-  if (m) return m[1].trim();
-  for (const c of KNOWN_CITIES) if (t.includes(" " + c + " ")) return c;
-  return "";
+function looksLikeReset(text = "") {
+  const t = (text || "").toLowerCase();
+  return /(olvida|reset|reinicia|empecemos|desde cero|borr[a|e]|empezar de nuevo)/i.test(
+    t
+  );
 }
 
-function extractZone(text) {
-  const t = norm(text);
-  for (const z of KNOWN_ZONES) if (t.includes(z)) return z;
-  if (t.includes("centro")) return "centro";
-  return "";
+function infoScore(slots) {
+  let s = 0;
+  if (!isEmpty(slots.city)) s += 2;
+  if (!isEmpty(slots.zone)) s += 1;
+  if (!isEmpty(slots.cuisine)) s += 2;
+  if (!isEmpty(slots.budget)) s += 1;
+  return s;
 }
 
-function extractCuisine(text) {
-  const t = norm(text);
-  // el más específico primero
-  for (const c of CUISINES.sort((a, b) => b.length - a.length)) {
-    if (t.includes(norm(c))) return c;
-  }
-  // frases genéricas
-  if (t.includes("antojo") || t.includes("se me antoja")) {
-    const m = t.match(/antoja(?:\s+de)?\s+([a-záéíóúüñ\s]{3,25})/i);
-    if (m) return m[1].trim();
-  }
-  return "";
-}
-
-function mergeSlots(prev = {}, incoming = {}) {
-  // Mantén lo previo si lo nuevo está vacío
-  const out = { city: "", zone: "", cuisine: "", budget: "", ...prev };
-  for (const k of ["city", "zone", "cuisine", "budget"]) {
-    if (incoming[k]) out[k] = String(incoming[k]).trim();
-  }
-  return out;
-}
-
-function detectReset(text) {
-  const t = norm(text);
-  return /reset|reinicia|empecemos de nuevo|olvida todo|borrar conversacion/.test(t);
-}
-
-function nextMissingSlot(slots) {
-  if (!slots.city) return "city";
-  if (!slots.cuisine) return "cuisine";
-  if (!slots.budget) return "budget";
-  if (!slots.zone) return "zone"; // zona es opcional, la pedimos al final
-  return "none";
-}
-
-// ---------- Prompting ----------
-function systemPrompt() {
-  return `
-Eres Remy, un guía amable de restaurantes. Objetivo:
-- Mantén CONTEXTO con los slots {city, zone, cuisine, budget}.
-- Si faltan datos, pregunta **solo por un slot a la vez** (pregunta breve).
-- Nunca pidas un slot que ya está lleno.
-- Si ya tienes lo necesario (city + cuisine; budget opcional), da 2–3 sugerencias útiles:
-  * nombre o tipo de lugar (sin inventar datos específicos ni direcciones exactas),
-  * por qué encaja (zona, ambiente, ticket aproximado),
-  * cierra con UNA pregunta de seguimiento clara.
-- Evita respuestas largas y repetitivas.
-Devuelve SOLO JSON válido con este esquema EXACTO:
-{
-  "reply": "<texto para el usuario>",
-  "slots": { "city": "...", "zone": "...", "cuisine": "...", "budget": "..." },
-  "next_slot": "<city|zone|cuisine|budget|none>"
-}`;
-}
-
-function userPrompt(message, username, slots, pending) {
-  return `
-Usuario: ${username || ""}
-
-Mensaje: ${message}
-
-Slots conocidos:
-- city: ${slots.city || "-"}
-- zone: ${slots.zone || "-"}
-- cuisine: ${slots.cuisine || "-"}
-- budget: ${slots.budget || "-"}
-
-Si "pending_slot" != "none", prioriza cerrar ese slot si el texto lo llena.
-pending_slot: ${pending}
-`;
-}
-
-// ---------- Rutas ----------
+// Health
 app.get("/", (_req, res) => res.send("remy-ai-backend up"));
 
-// ManyChat -> POST /recommendation
 app.post("/recommendation", async (req, res) => {
-  let {
-    message = "",
-    username = "",
-    manychat_user_id = "",
-    slots: incomingSlots = {},
-    pending_slot = "none",
-  } = req.body || {};
-
-  // 1) Reset si el usuario lo pide
-  if (detectReset(message)) {
-    const empty = { city: "", zone: "", cuisine: "", budget: "" };
-    return res.json({
-      reply:
-        "Listo, reinicié la conversación. ¿En qué ciudad estás y qué se te antoja?",
-      slots: empty,
-      next_slot: "city",
-    });
-  }
-
-  // 2) Merge de slots previos + detectar nuevos desde el mensaje
-  let slots = mergeSlots(incomingSlots, {
-    // si el usuario acaba de escribir, intenta extraer
-    budget: extractBudget(message),
-    city: extractCity(message),
-    zone: extractZone(message),
-    cuisine: extractCuisine(message),
-  });
-
-  // 3) Si había un pending_slot, intenta forzarlo desde el mensaje
-  if (pending_slot && pending_slot !== "none") {
-    if (pending_slot === "budget" && !slots.budget) slots.budget = extractBudget(message);
-    if (pending_slot === "city" && !slots.city) slots.city = extractCity(message);
-    if (pending_slot === "zone" && !slots.zone) slots.zone = extractZone(message);
-    if (pending_slot === "cuisine" && !slots.cuisine) slots.cuisine = extractCuisine(message);
-  }
-
-  // 4) Decide qué falta
-  let wantNext = nextMissingSlot(slots);
-
   try {
+    const {
+      message = "",
+      username = "",
+      manychat_user_id = "",
+      slots: clientSlots = {},
+    } = req.body || {};
+
+    // Normalizamos slots que vienen de Manychat
+    let slots = {
+      city: clean(clientSlots.city || ""),
+      zone: clean(clientSlots.zone || ""),
+      cuisine: clean(clientSlots.cuisine || ""),
+      budget: clean(clientSlots.budget || ""),
+    };
+
+    // Reset conversacional
+    if (looksLikeReset(message)) {
+      slots = { city: "", zone: "", cuisine: "", budget: "" };
+      return res.json({
+        reply:
+          "Listo, reinicié la conversación. ¿En qué ciudad estás y qué se te antoja?",
+        followup: "Cuéntame ciudad y antojo para empezar ;)",
+        slots,
+        next_slot: "city",
+      });
+    }
+
+    // Relleno de presupuesto si el usuario lo escribió libre
+    if (isEmpty(slots.budget)) {
+      const b = extractBudget(message);
+      if (b) slots.budget = b;
+    }
+
+    // Decidimos si ya podemos recomendar “best-effort”
+    const score = infoScore(slots);
+    const minimalHasCityOrZone = !isEmpty(slots.city) || !isEmpty(slots.zone);
+    const hasCuisineOrMentions =
+      !isEmpty(slots.cuisine) ||
+      /(taco|ramen|sushi|pizza|pasta|carnita|mexican|japon|ital|burger|marisc)/i.test(
+        message
+      );
+
+    const canRecommend = minimalHasCityOrZone && hasCuisineOrMentions;
+
+    // Priorización de siguiente campo a pedir
+    const missingOrder = [
+      isEmpty(slots.city) && isEmpty(slots.zone) ? "city" : "",
+      isEmpty(slots.cuisine) ? "cuisine" : "",
+      isEmpty(slots.budget) ? "budget" : "",
+      isEmpty(slots.zone) ? "zone" : "",
+    ].filter(Boolean);
+    const next_slot = canRecommend ? missingOrder[0] || "" : missingOrder[0] || "city";
+
+    // Instrucciones al modelo
+    const system = `
+Eres Remy, un guía de restaurantes conversacional.
+Reglas:
+- Responde SIEMPRE en el idioma del usuario.
+- Devuelve SOLO JSON válido con este esquema:
+{
+  "reply": "<texto para enviar al usuario>",
+  "followup": "<pregunta breve para continuar>",
+  "slots": { "city": "...", "zone": "...", "cuisine": "...", "budget": "..." },
+  "next_slot": "<city|zone|cuisine|budget|>"
+}
+- Si tienes al menos CIUDAD/ZONA y un ANTOJO (o el mensaje lo deja claro), da una
+  RECOMENDACIÓN INICIAL inmediatamente (2–3 opciones).
+- No inventes datos duros (direcciones, horarios, teléfonos). Nombres genéricos están bien
+  (p.ej. "Trattoria acogedora en el Centro", "Barra de sushi clásica en Providencia").
+- Formato de recomendaciones: viñetas cortas con (tipo de lugar — qué pedir — ambiente).
+- Después de recomendar, pide SOLO UN dato que falte (next_slot) con una followup breve.
+- Si NO tienes la información mínima (ni ciudad/zona ni antojo), pide solo UNO de esos datos.
+- Nunca repitas preguntas ya respondidas en el último turno. Sé conciso.
+`;
+
+    const user = `
+Usuario: ${username || "Instagram"}
+ManyChatID: ${manychat_user_id || ""}
+Mensaje: ${message}
+
+Slots actuales:
+- city: ${slots.city || "null"}
+- zone: ${slots.zone || "null"}
+- cuisine: ${slots.cuisine || "null"}
+- budget: ${slots.budget || "null"}
+
+Modo: ${canRecommend ? "BEST_EFFORT_RECOMMEND" : "ASK_MINIMUM"}
+
+Recuerda: devuelve SOLO JSON válido.`;
+
     const completion = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
+      model: "gpt-4",
       temperature: 0.6,
       messages: [
-        { role: "system", content: systemPrompt() },
-        { role: "user", content: userPrompt(message, username, slots, pending_slot || wantNext) },
+        { role: "system", content: system.trim() },
+        { role: "user", content: user.trim() },
       ],
     });
 
-    let content = completion.choices?.[0]?.message?.content?.trim() || "";
-    // Intento robusto de parseo JSON
-    let reply = "";
-    let modelSlots = {};
-    let next_slot = wantNext;
+    let content = completion.choices?.[0]?.message?.content?.trim() || "{}";
 
-    const tryParse = (text) => {
-      try { return JSON.parse(text); } catch { 
-        const m = text.match(/\{[\s\S]*\}$/); 
-        if (m) { try { return JSON.parse(m[0]); } catch {} }
-        return null;
+    // Parse robusto
+    let data = {};
+    try {
+      data = JSON.parse(content);
+    } catch {
+      const m = content.match(/\{[\s\S]*\}/);
+      if (m) {
+        try {
+          data = JSON.parse(m[0]);
+        } catch {}
       }
-    };
-
-    const parsed = tryParse(content);
-    if (parsed && typeof parsed === "object") {
-      reply = String(parsed.reply || "").trim();
-      modelSlots = parsed.slots || {};
-      next_slot = parsed.next_slot || next_slot;
     }
-
-    // Merge de slots (modelo puede haber normalizado)
-    slots = mergeSlots(slots, modelSlots);
 
     // Fallbacks
-    if (!reply) {
-      if (wantNext !== "none") {
-        const map = { city: "¿En qué ciudad estás?", cuisine: "¿Qué se te antoja?", budget: "¿Cuál es tu presupuesto aproximado?", zone: "¿Alguna zona o colonia preferida?" };
-        reply = map[wantNext] || "¿Qué se te antoja y en qué ciudad estás?";
-      } else {
-        reply = "Puedo sugerirte lugares según tu antojo, zona y presupuesto. ¿Quieres que te recomiende ahora?";
-      }
-    }
+    const reply =
+      clean(data.reply) ||
+      (canRecommend
+        ? "Aquí van algunas ideas interesantes. ¿Te pido un dato más para afinar?"
+        : "¿En qué ciudad estás y qué se te antoja?");
+    const followup =
+      clean(data.followup) ||
+      (canRecommend
+        ? (next_slot === "budget"
+            ? "¿Cuál es tu presupuesto aproximado?"
+            : next_slot === "zone"
+            ? "¿Alguna zona de la ciudad que prefieras?"
+            : "¿Quieres otra opción o cambiamos de tipo de comida?")
+        : next_slot === "city"
+        ? "¿En qué ciudad estás?"
+        : "¿Qué se te antoja?");
+    const outSlots = {
+      city: clean(data.slots?.city) || slots.city,
+      zone: clean(data.slots?.zone) || slots.zone,
+      cuisine: clean(data.slots?.cuisine) || slots.cuisine,
+      budget: clean(data.slots?.budget) || slots.budget,
+    };
+    const outNext = clean(data.next_slot) || next_slot || "";
 
-    // Si faltan slots clave, fuerza el next_slot a lo que realmente falte ahora
-    const realNext = nextMissingSlot(slots);
-    if (realNext !== "none") next_slot = realNext;
-
-    return res.json({ reply, slots, next_slot });
+    return res.json({
+      reply,
+      followup,
+      slots: outSlots,
+      next_slot: outNext,
+    });
   } catch (err) {
     console.error(err);
-    // Respuesta segura en caso de error
-    const fallback = nextMissingSlot(slots);
-    const map = { city: "¿En qué ciudad estás?", cuisine: "¿Qué se te antoja?", budget: "¿Cuál es tu presupuesto aproximado?" };
-    return res.status(200).json({
-      reply: map[fallback] || "¿Qué se te antoja y en qué ciudad estás?",
-      slots,
-      next_slot: fallback,
-    });
+    return res
+      .status(500)
+      .json({ reply: "Tuve un problema. ¿Probamos de nuevo?", followup: "" });
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Servidor Remy en puerto ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Servidor corriendo en puerto ${PORT}`);
+});
