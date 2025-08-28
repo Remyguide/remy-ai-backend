@@ -1,4 +1,5 @@
-// index.js
+// index.js  — Remy backend con memoria de "slots" y respuesta JSON para ManyChat
+
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
@@ -12,143 +13,225 @@ app.use(express.json());
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// ---------------------- Guardas costo/cache ----------------------
-const memCache = new Map(); // key -> { ts, data }
-const DAY_MS = 24 * 60 * 60 * 1000;
+// ---------- Utilidades simples de extracción ----------
+const norm = (s = "") => (s || "").toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
 
-// límites configurables por env
-const MAX_GLOBAL = Number(process.env.MAX_PLACES_CALLS_PER_DAY || 200);
-const MAX_USER   = Number(process.env.MAX_PLACES_CALLS_PER_USER || 5);
-const CACHE_TTL  = Number(process.env.SEARCH_CACHE_TTL_MS || 6*60*60*1000); // 6h
+const KNOWN_CITIES = [
+  "cdmx","ciudad de mexico","mexico city","guadalajara","zapopan","queretaro","santiago de queretaro",
+  "monterrey","san pedro","merida","puebla","tijuana","leon","celaya","ibiza","cordoba","cordoba veracruz",
+  "veracruz","cancun","polanco","roma","condesa"
+];
 
-let daily = { date: new Date().toDateString(), globalCalls: 0, perUser: {} };
+const KNOWN_ZONES = [
+  "centro","polanco","roma","condesa","del valle","napoles","providencia","chapultepec","oblatos","satelite"
+];
 
-function resetDailyIfNeeded() {
-  const today = new Date().toDateString();
-  if (daily.date !== today) daily = { date: today, globalCalls: 0, perUser: {} };
-}
-function canSpend(userId) {
-  resetDailyIfNeeded();
-  const per = daily.perUser[userId] || 0;
-  return daily.globalCalls < MAX_GLOBAL && per < MAX_USER;
-}
-function spend(userId) {
-  daily.globalCalls++;
-  daily.perUser[userId] = (daily.perUser[userId] || 0) + 1;
-}
-function keyFrom({ city, area, cuisine, budget }) {
-  const bucket = budget ? Math.round(Number(budget) / 100) * 100 : "x";
-  return [city?.toLowerCase(), area?.toLowerCase() || "", cuisine?.toLowerCase(), bucket].join("|");
-}
-function getCache(k) {
-  const hit = memCache.get(k);
-  if (!hit) return null;
-  if (Date.now() - hit.ts > CACHE_TTL) { memCache.delete(k); return null; }
-  return hit.data; // { reply, followup }
-}
-function setCache(k, data) {
-  memCache.set(k, { ts: Date.now(), data });
+const CUISINES = [
+  "tacos","tacos al pastor","tacos de carnitas","ramen","sushi","pizza","hamburguesas","mariscos","pozole",
+  "cochinita","barbacoa","café","cafe","chilaquiles","cortes","parrilla","alitas","tortas","tlayudas","birria"
+];
+
+function extractBudget(text) {
+  const t = norm(text);
+  // $200, 200 pesos, 200 mxn
+  const m = t.match(/(?:\$|\bmxn?\b\s*)?(\d{2,5})(?:\s*(?:mxn|pesos)?)?/i);
+  return m ? m[1] : "";
 }
 
-// ---------------------- Rutas ----------------------
+function extractCity(text) {
+  const t = " " + norm(text) + " ";
+  // después de "en " capturar 1-3 palabras
+  const m = t.match(/\sen\s([a-záéíóúüñ]+(?:\s+[a-záéíóúüñ]+){0,2})\s/);
+  if (m) return m[1].trim();
+  for (const c of KNOWN_CITIES) if (t.includes(" " + c + " ")) return c;
+  return "";
+}
+
+function extractZone(text) {
+  const t = norm(text);
+  for (const z of KNOWN_ZONES) if (t.includes(z)) return z;
+  if (t.includes("centro")) return "centro";
+  return "";
+}
+
+function extractCuisine(text) {
+  const t = norm(text);
+  // el más específico primero
+  for (const c of CUISINES.sort((a, b) => b.length - a.length)) {
+    if (t.includes(norm(c))) return c;
+  }
+  // frases genéricas
+  if (t.includes("antojo") || t.includes("se me antoja")) {
+    const m = t.match(/antoja(?:\s+de)?\s+([a-záéíóúüñ\s]{3,25})/i);
+    if (m) return m[1].trim();
+  }
+  return "";
+}
+
+function mergeSlots(prev = {}, incoming = {}) {
+  // Mantén lo previo si lo nuevo está vacío
+  const out = { city: "", zone: "", cuisine: "", budget: "", ...prev };
+  for (const k of ["city", "zone", "cuisine", "budget"]) {
+    if (incoming[k]) out[k] = String(incoming[k]).trim();
+  }
+  return out;
+}
+
+function detectReset(text) {
+  const t = norm(text);
+  return /reset|reinicia|empecemos de nuevo|olvida todo|borrar conversacion/.test(t);
+}
+
+function nextMissingSlot(slots) {
+  if (!slots.city) return "city";
+  if (!slots.cuisine) return "cuisine";
+  if (!slots.budget) return "budget";
+  if (!slots.zone) return "zone"; // zona es opcional, la pedimos al final
+  return "none";
+}
+
+// ---------- Prompting ----------
+function systemPrompt() {
+  return `
+Eres Remy, un guía amable de restaurantes. Objetivo:
+- Mantén CONTEXTO con los slots {city, zone, cuisine, budget}.
+- Si faltan datos, pregunta **solo por un slot a la vez** (pregunta breve).
+- Nunca pidas un slot que ya está lleno.
+- Si ya tienes lo necesario (city + cuisine; budget opcional), da 2–3 sugerencias útiles:
+  * nombre o tipo de lugar (sin inventar datos específicos ni direcciones exactas),
+  * por qué encaja (zona, ambiente, ticket aproximado),
+  * cierra con UNA pregunta de seguimiento clara.
+- Evita respuestas largas y repetitivas.
+Devuelve SOLO JSON válido con este esquema EXACTO:
+{
+  "reply": "<texto para el usuario>",
+  "slots": { "city": "...", "zone": "...", "cuisine": "...", "budget": "..." },
+  "next_slot": "<city|zone|cuisine|budget|none>"
+}`;
+}
+
+function userPrompt(message, username, slots, pending) {
+  return `
+Usuario: ${username || ""}
+
+Mensaje: ${message}
+
+Slots conocidos:
+- city: ${slots.city || "-"}
+- zone: ${slots.zone || "-"}
+- cuisine: ${slots.cuisine || "-"}
+- budget: ${slots.budget || "-"}
+
+Si "pending_slot" != "none", prioriza cerrar ese slot si el texto lo llena.
+pending_slot: ${pending}
+`;
+}
+
+// ---------- Rutas ----------
 app.get("/", (_req, res) => res.send("remy-ai-backend up"));
 
+// ManyChat -> POST /recommendation
 app.post("/recommendation", async (req, res) => {
-  const { message = "", username = "", manychat_user_id = "" } = req.body || {};
+  let {
+    message = "",
+    username = "",
+    manychat_user_id = "",
+    slots: incomingSlots = {},
+    pending_slot = "none",
+  } = req.body || {};
+
+  // 1) Reset si el usuario lo pide
+  if (detectReset(message)) {
+    const empty = { city: "", zone: "", cuisine: "", budget: "" };
+    return res.json({
+      reply:
+        "Listo, reinicié la conversación. ¿En qué ciudad estás y qué se te antoja?",
+      slots: empty,
+      next_slot: "city",
+    });
+  }
+
+  // 2) Merge de slots previos + detectar nuevos desde el mensaje
+  let slots = mergeSlots(incomingSlots, {
+    // si el usuario acaba de escribir, intenta extraer
+    budget: extractBudget(message),
+    city: extractCity(message),
+    zone: extractZone(message),
+    cuisine: extractCuisine(message),
+  });
+
+  // 3) Si había un pending_slot, intenta forzarlo desde el mensaje
+  if (pending_slot && pending_slot !== "none") {
+    if (pending_slot === "budget" && !slots.budget) slots.budget = extractBudget(message);
+    if (pending_slot === "city" && !slots.city) slots.city = extractCity(message);
+    if (pending_slot === "zone" && !slots.zone) slots.zone = extractZone(message);
+    if (pending_slot === "cuisine" && !slots.cuisine) slots.cuisine = extractCuisine(message);
+  }
+
+  // 4) Decide qué falta
+  let wantNext = nextMissingSlot(slots);
 
   try {
-    // 1) NLU barato: detectar intención + slots
-    const nlu = await openai.chat.completions.create({
+    const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
-      temperature: 0,
-      response_format: { type: "json_object" },
+      temperature: 0.6,
       messages: [
-        {
-          role: "system",
-          content:
-            "Extrae JSON con schema {intent:'SEARCH'|'CHAT', city, area, cuisine, budget_mxn}. " +
-            "Si faltan datos para buscar, usa intent:'CHAT'."
-        },
-        { role: "user", content: message }
-      ]
+        { role: "system", content: systemPrompt() },
+        { role: "user", content: userPrompt(message, username, slots, pending_slot || wantNext) },
+      ],
     });
 
-    let slots = {};
-    try { slots = JSON.parse(nlu.choices?.[0]?.message?.content || "{}"); } catch {}
-    const intent  = slots.intent || "CHAT";
-    const city    = (slots.city || "").trim();
-    const area    = (slots.area || "").trim();
-    const cuisine = (slots.cuisine || "").trim();
-    const budget  = slots.budget_mxn ? Number(slots.budget_mxn) : null;
+    let content = completion.choices?.[0]?.message?.content?.trim() || "";
+    // Intento robusto de parseo JSON
+    let reply = "";
+    let modelSlots = {};
+    let next_slot = wantNext;
 
-    const hasQuery = city && cuisine;
+    const tryParse = (text) => {
+      try { return JSON.parse(text); } catch { 
+        const m = text.match(/\{[\s\S]*\}$/); 
+        if (m) { try { return JSON.parse(m[0]); } catch {} }
+        return null;
+      }
+    };
 
-    // 2) Si aún falta info: conversa y pide SOLO lo que falta
-    if (intent !== "SEARCH" || !hasQuery) {
-      const clarify = await openai.chat.completions.create({
-        model: "gpt-4",
-        temperature: 0.7,
-        messages: [
-          {
-            role: "system",
-            content:
-              "Eres Remy. Responde breve, amistoso y pide SOLO el dato que falta " +
-              "(ciudad, antojo/cocina o presupuesto). No inventes lugares."
-          },
-          { role: "user", content: message }
-        ]
-      });
-      return res.json({
-        reply: clarify.choices?.[0]?.message?.content?.trim() || "¿Me dices ciudad y antojo?",
-        followup: "Cuando me des ciudad + antojo, te busco opciones."
-      });
+    const parsed = tryParse(content);
+    if (parsed && typeof parsed === "object") {
+      reply = String(parsed.reply || "").trim();
+      modelSlots = parsed.slots || {};
+      next_slot = parsed.next_slot || next_slot;
     }
 
-    // 3) Confirmación antes de gastar
-    const wantsSearch = /(^|\b)(sí|si|buscar|dale|ok|hazlo)\b/i.test(message);
-    if (!wantsSearch) {
-      return res.json({
-        reply: `Puedo buscar ${cuisine} en ${area ? area + ", " : ""}${city}. ¿Quieres que busque ahora?`,
-        followup: "Responde “sí” para buscar, o dime colonia/presupuesto."
-      });
+    // Merge de slots (modelo puede haber normalizado)
+    slots = mergeSlots(slots, modelSlots);
+
+    // Fallbacks
+    if (!reply) {
+      if (wantNext !== "none") {
+        const map = { city: "¿En qué ciudad estás?", cuisine: "¿Qué se te antoja?", budget: "¿Cuál es tu presupuesto aproximado?", zone: "¿Alguna zona o colonia preferida?" };
+        reply = map[wantNext] || "¿Qué se te antoja y en qué ciudad estás?";
+      } else {
+        reply = "Puedo sugerirte lugares según tu antojo, zona y presupuesto. ¿Quieres que te recomiende ahora?";
+      }
     }
 
-    // 4) Cache
-    const cacheKey = keyFrom({ city, area, cuisine, budget });
-    const cached = getCache(cacheKey);
-    if (cached) return res.json(cached);
+    // Si faltan slots clave, fuerza el next_slot a lo que realmente falte ahora
+    const realNext = nextMissingSlot(slots);
+    if (realNext !== "none") next_slot = realNext;
 
-    // 5) Cupos diarios
-    if (!canSpend(manychat_user_id)) {
-      const reply =
-        `Tengo búsquedas recientes de ${cuisine} en ${city}. ` +
-        `Puedes explorar aquí (sin costo): ` +
-        `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(cuisine + " " + (area ? area + " " : "") + city)}\n\n` +
-        `Si quieres, dime colonia o un presupuesto y afinamos.`;
-      const payload = { reply, followup: "¿Ajustamos zona o presupuesto?" };
-      setCache(cacheKey, payload);
-      return res.json(payload);
-    }
-
-    // 6) (Opcional) Integración con Places — DESACTIVADA por defecto
-    // Aquí iría UNA llamada a Places (máx. 10-20 resultados) si decides activarla.
-    // spend(manychat_user_id); setCache(cacheKey, {reply, followup}); return res.json({reply, followup});
-
-    // Zero-API elegante (sin coste variable):
-    const reply =
-      `Te dejo una búsqueda directa de ${cuisine} en ${area ? area + ", " : ""}${city}: ` +
-      `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(cuisine + " " + (area ? area + " " : "") + city)}\n\n` +
-      `¿Quieres que te sugiera una ruta o ver otra cocina/zona?`;
-    const payload = { reply, followup: "¿Cambiamos zona o presupuesto?" };
-    setCache(cacheKey, payload);
-    return res.json(payload);
-
+    return res.json({ reply, slots, next_slot });
   } catch (err) {
     console.error(err);
-    return res.status(500).json({ error: "Error generating recommendation" });
+    // Respuesta segura en caso de error
+    const fallback = nextMissingSlot(slots);
+    const map = { city: "¿En qué ciudad estás?", cuisine: "¿Qué se te antoja?", budget: "¿Cuál es tu presupuesto aproximado?" };
+    return res.status(200).json({
+      reply: map[fallback] || "¿Qué se te antoja y en qué ciudad estás?",
+      slots,
+      next_slot: fallback,
+    });
   }
 });
 
-// ---------------------- Server ----------------------
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Servidor corriendo en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`Servidor Remy en puerto ${PORT}`));
