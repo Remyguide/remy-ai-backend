@@ -1,4 +1,4 @@
-// Remy "Chef" Backend v4.1 — flujo conversacional robusto
+// Remy "Chef" Backend v4.2 — Saludo y lógica de flujo robusta
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
@@ -9,7 +9,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const BUILD = "4.1.0";
+const BUILD = "4.2.0";
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 // =============== Sesiones ===============
@@ -62,6 +62,7 @@ function detectLang(text = "") {
   if (/(hola|buenas|ciudad|zona|antojo|presupuesto|cdmx|méxico|mexico)/i.test(t)) return "es";
   return "en";
 }
+
 function useLang(current, message) {
   return detectLang(message) || current || "es";
 }
@@ -127,7 +128,6 @@ async function extractNLU(message, prevSlots) {
     const txt = r.choices?.[0]?.message?.content?.trim() || "{}";
     const j = JSON.parse(txt);
     if (!j.updates) j.updates = {};
-    // respaldo
     j.updates.city ||= rxCity(message);
     j.updates.cuisine ||= rxCuisine(message);
     j.updates.budget ||= rxBudget(message);
@@ -165,6 +165,7 @@ async function geocode(q) {
   const arr = await r.json();
   return arr?.[0] || null;
 }
+
 async function geocodeCityZone(city, zone) {
   const first = await geocode(zone ? `${zone}, ${city}` : city);
   if (!first || !first.lat || !first.lon || first.type === "country") {
@@ -249,6 +250,7 @@ function toPlace(e) {
     hasContact: !!(t.website || t.phone || t["contact:website"] || t["contact:phone"]),
   };
 }
+
 function dedupe(arr) {
   const seen = new Set();
   return arr.filter(p => {
@@ -304,7 +306,8 @@ async function searchPlaces({ lat, lon, cuisine = "", zoneProvided = false }) {
 
   let els = await overpass({ lat, lon, radius, nameRe, cuisineRe, includeFastFood: wantStreet, dietFlag: diet });
   if (!els.length) { radius = Math.min(6000, radius + 2500);
-    els = await overpass({ lat, lon, radius, nameRe, cuisineRe, includeFastFood: wantStreet, dietFlag: diet }); }
+    els = await overpass({ lat, lon, radius, nameRe, cuisineRe, includeFastFood: wantStreet, dietFlag: diet });
+  }
 
   const places = dedupe(els.map(toPlace))
     .map(p => ({ ...p, _score: scoreQuality(p, wantStreet, cuisine) }))
@@ -320,6 +323,7 @@ function greet(lang) {
     ? "¡Hola! Soy Remy 👋 Chef de cabecera y cazador de buenos lugares. ¿En qué ciudad estás y qué se te antoja?"
     : "Hey! I'm Remy 👋 a chef-y guide to great spots. Which city are you in and what are you craving?";
 }
+
 function ask(slot, lang) {
   const es = lang === "es";
   const m = {
@@ -330,6 +334,7 @@ function ask(slot, lang) {
   };
   return m[slot];
 }
+
 function listMessage(items, lang, ctx) {
   const es = lang === "es";
   const head = es ? `Te dejo opciones${ctx ? ` en ${ctx}` : ""}:` : `Here are some options${ctx ? ` in ${ctx}` : ""}:`;
@@ -340,6 +345,7 @@ function listMessage(items, lang, ctx) {
   }).join("\n");
   return `${head}\n${body}`;
 }
+
 function softNudge(lang, city, cuisine) {
   const es = lang === "es";
   if (es) {
@@ -381,6 +387,7 @@ app.post("/recommendation", async (req, res) => {
       });
     }
 
+    // Procesar slots del body y mensaje del usuario
     const slotsBefore = setSlots(manychat_user_id, {
       city: bodyCity, zone: bodyZone, cuisine: bodyCuisine, budget: bodyBudget,
       ...(bodySlots || {})
@@ -389,7 +396,8 @@ app.post("/recommendation", async (req, res) => {
     setSlots(manychat_user_id, nlu.updates);
     const slots = session(manychat_user_id).slots;
 
-    if (idle || (isHello && !slots.city)) {
+    // Lógica de flujo principal
+    if (idle || isHello) {
       s.greetedAt = Date.now();
       return res.json({
         reply: greet(s.lang),
@@ -403,7 +411,8 @@ app.post("/recommendation", async (req, res) => {
       return res.json({
         reply: s.lang === "es" ? "Para ayudarte bien, dime tu ciudad." : "To help properly, tell me your city.",
         followup: ask("city", s.lang),
-        slots, next_slot: "city"
+        slots,
+        next_slot: "city"
       });
     }
 
@@ -413,7 +422,8 @@ app.post("/recommendation", async (req, res) => {
           ? `Perfecto, ${slots.city}. ¿Qué se te antoja hoy?`
           : `Great, ${slots.city}. What are you craving today?`,
         followup: ask("cuisine", s.lang),
-        slots, next_slot: "cuisine"
+        slots,
+        next_slot: "cuisine"
       });
     }
 
@@ -424,7 +434,8 @@ app.post("/recommendation", async (req, res) => {
           ? `No ubico bien ${slots.zone ? `${slots.zone}, ` : ""}${slots.city}. ¿Qué colonia te queda cómodo?`
           : `I couldn't place ${slots.zone ? `${slots.zone}, ` : ""}${slots.city}. Which neighborhood works for you?`,
         followup: ask("zone", s.lang),
-        slots, next_slot: "zone"
+        slots,
+        next_slot: "zone"
       });
     }
 
@@ -439,7 +450,8 @@ app.post("/recommendation", async (req, res) => {
       return res.json({
         reply: softNudge(s.lang, slots.city, slots.cuisine),
         followup: slots.zone ? ask("cuisine", s.lang) : ask("zone", s.lang),
-        slots, next_slot: slots.zone ? "cuisine" : "zone"
+        slots,
+        next_slot: slots.zone ? "cuisine" : "zone"
       });
     }
 
@@ -454,7 +466,6 @@ app.post("/recommendation", async (req, res) => {
       slots,
       next_slot: follow ? (follow === ask("zone", s.lang) ? "zone" : "budget") : ""
     });
-
   } catch (err) {
     console.error(err);
     return res.status(500).json({
