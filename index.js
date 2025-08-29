@@ -1,4 +1,4 @@
-// Remy Backend v3.3 – saludo amable, idioma consistente, NLU robusto y sugerencias sin fricción
+// Remy "Chef" Backend v4.0 — saludo primero, idioma del usuario, y calidad por encima de cantidad
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
@@ -9,24 +9,36 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const BUILD = "3.3.0";
+const BUILD = "4.0.0";
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// --------- Sesiones en memoria ---------
+// =============== Sesiones ===============
 const SESS = new Map();
-function getS(id) {
+const SESSION_IDLE_MS = 15 * 60 * 1000; // 15 min
+
+function session(id) {
   if (!SESS.has(id)) {
     SESS.set(id, {
       lang: "es",
       slots: { city: "", zone: "", cuisine: "", budget: "" },
+      greetedAt: 0,
       lastAsked: "",
-      lastMsgAt: Date.now(),
+      lastMsgAt: 0,
     });
   }
   return SESS.get(id);
 }
-function saveSlots(id, upd = {}) {
-  const s = getS(id);
+
+function reset(id) {
+  const s = session(id);
+  s.slots = { city: "", zone: "", cuisine: "", budget: "" };
+  s.lastAsked = "";
+  s.greetedAt = 0;
+  s.lastMsgAt = Date.now();
+}
+
+function setSlots(id, upd = {}) {
+  const s = session(id);
   const norm = (v) => (typeof v === "string" ? v.trim() : v || "");
   const merged = { ...s.slots, ...upd };
   if (merged.budget) {
@@ -42,31 +54,26 @@ function saveSlots(id, upd = {}) {
   s.lastMsgAt = Date.now();
   return s.slots;
 }
-function resetS(id) {
-  const s = getS(id);
-  s.slots = { city: "", zone: "", cuisine: "", budget: "" };
-  s.lastAsked = "";
-  s.lastMsgAt = Date.now();
-}
 
-// --------- Idioma ---------
-function guessLang(text = "") {
+// =============== Idioma ===============
+function detectLang(text = "") {
   const t = text.toLowerCase();
   if (/[áéíóúñü¿¡]/.test(t)) return "es";
-  if (/(hola|estoy|ciudad|zona|presupuesto|antojo|quiero|cdmx|méxico|mexico)/i.test(t)) return "es";
+  if (/(hola|buenas|ciudad|zona|antojo|presupuesto|cdmx|méxico|mexico)/i.test(t)) return "es";
   return "en";
 }
-function keepLang(message, current = "es") {
-  const g = guessLang(message);
-  return g || current;
+function useLang(current, message) {
+  // Responde en el idioma del último mensaje del usuario
+  return detectLang(message) || current || "es";
 }
 
-// --------- Detectores rápidos (regex) ---------
-const HELLO_RE = /\b(hola|qué onda|buenas|hello|hi|hey)\b/i;
+// =============== Extractores rápidos ===============
+const GREET_RE = /\b(hola|qué onda|buenas|hello|hi|hey)\b/i;
 const RESET_RE = /(olvida|reinicia|empecemos de nuevo|reset)/i;
 
+const WANT_SURPRISE_RE = /(sorpr[eé]ndeme|recom[ií]end[a|ame]|lo que t[uú] sugieras)/i;
+
 function rxCity(msg) {
-  // “estoy en X”, “en X”, “ahora en X”
   const m =
     msg.match(/\b(?:estoy|ahora)\s+en\s+([a-záéíóúüñ .'-]+)$/i) ||
     msg.match(/^\s*en\s+([a-záéíóúüñ .'-]+)\s*$/i);
@@ -80,11 +87,10 @@ function rxCuisine(msg) {
     { re: /(pizza|trattoria|pasta|italian|italiana|osteria)/i, v: "italiana" },
     { re: /(tacos?|pastor|birria|barbacoa|taquer)/i, v: "tacos" },
     { re: /(veg(etari[ao]|an))/i, v: "vegetariana" },
-    { re: /(burg(er|uesa)|hamburg)/i, v: "hamburguesa" },
     { re: /(mariscos?|sea ?food)/i, v: "mariscos" },
+    { re: /(burg(er|uesa)|hamburg)/i, v: "hamburguesa" },
   ];
   for (const e of map) if (e.re.test(msg)) return e.v;
-  // frases “tengo antojo de … / se me antoja … / quiero …”
   const m = msg.match(/(?:tengo\s+antojo\s+de|se\s+me\s+antoja|quiero)\s+([a-záéíóúüñ .'-]+)/i);
   return m ? m[1].trim() : "";
 }
@@ -94,20 +100,17 @@ function rxBudget(msg) {
   return m ? m[1] : "";
 }
 
-// --------- NLU (LLM + regex respaldo) ---------
-async function extractNLU(message, prev) {
-  const sys = `Devuelve SOLO JSON exacto:
-{
-  "updates": { "city": "", "zone": "", "cuisine": "", "budget": "" },
-  "intent": "recommend|update|reset|chitchat|why|unknown"
-}
-Reglas:
-- "olvida/reinicia/empecemos de nuevo" => intent=reset.
-- Si dice "hola/hello/hi/hey" => intent=chitchat (no pidas info todavía).
-- "estoy en/ahora en/en X" => updates.city.
-- "zona/por la zona de/en la colonia X" => updates.zone.
-- "tengo antojo de/quiero/se me antoja X" => updates.cuisine.
-- Presupuesto "$300/300 pesos" => updates.budget (solo número).`;
+// =============== NLU (mezcla LLM + regex) ===============
+async function extractNLU(message, prevSlots) {
+  const sys = `Devuelve SOLO JSON:
+{"updates":{"city":"","zone":"","cuisine":"","budget":""},"intent":"recommend|update|reset|chitchat|unknown"}
+- "olvida/reinicia..." => intent=reset
+- "hola/hello/hi..." => chitchat
+- "estoy en/en X" => city
+- "zona/colonia X" => zone
+- "tengo antojo de/quiero/se me antoja X" => cuisine
+- "$300 / 300 pesos" => budget (solo número)
+- Si dice "sorpréndeme/recomiéndame" => intent=recommend`;
 
   try {
     const r = await openai.chat.completions.create({
@@ -115,26 +118,26 @@ Reglas:
       temperature: 0,
       messages: [
         { role: "system", content: sys },
-        { role: "user", content: `msg: """${message}"""\nprev: ${JSON.stringify(prev)}` },
+        { role: "user", content: `msg: """${message}"""\nprev: ${JSON.stringify(prevSlots)}` },
       ],
     });
     const txt = r.choices?.[0]?.message?.content?.trim() || "{}";
     const j = JSON.parse(txt);
     if (!j.updates) j.updates = {};
-    // Respaldo regex por si el LLM no pesca algo
+    // respaldo
     j.updates.city ||= rxCity(message);
     j.updates.cuisine ||= rxCuisine(message);
     j.updates.budget ||= rxBudget(message);
-    if (!j.intent) j.intent = RESET_RE.test(message) ? "reset" : HELLO_RE.test(message) ? "chitchat" : "update";
+    if (!j.intent) j.intent = GREET_RE.test(message) ? "chitchat" : "update";
     return j;
   } catch {
     return { updates: { city: rxCity(message), cuisine: rxCuisine(message), budget: rxBudget(message) }, intent: "update" };
   }
 }
 
-// --------- OSM / Overpass ---------
+// =============== Geocodificación (Nominatim/OSM) ===============
 const NOMINATIM_EMAIL = process.env.NOMINATIM_EMAIL || "remy@example.com";
-const UA = `Remy/${BUILD} (${NOMINATIM_EMAIL})`;
+const UA = `Remy-Chef/${BUILD} (${NOMINATIM_EMAIL})`;
 
 function normalizeCity(c) {
   const s = (c || "").toLowerCase().trim();
@@ -167,14 +170,14 @@ async function geocodeCityZone(city, zone) {
   return first;
 }
 
+// =============== Búsqueda Overpass (OSM) ===============
 const CHAIN_RE = [
-  /vips/i, /sanborns/i, /toks/i, /starbucks/i, /domino/i, /pizza\s*hutm?/i,
-  /little\s*caesars/i, /papa\s*john/i, /kfc/i, /burger\s*king|bk/i, /subway/i,
-  /ihop/i, /chili'?s/i, /applebee'?s/i, /olive\s*garden/i, /dennys?/i,
-  /sushi\s*roll/i, /wingstop/i
+  /vips/i, /sanborns/i, /toks/i, /starbucks/i, /domino/i, /little\s*caesars/i, /papa\s*john/i,
+  /pizza\s*hutm?/i, /kfc/i, /burger\s*king|bk/i, /subway/i, /ihop/i, /chili'?s/i, /applebee'?s/i,
+  /olive\s*garden/i, /dennys?/i, /sushi\s*roll/i, /wingstop/i, /potzolcalli/i, /farolito/i
 ];
 const FINE_RE = /trattoria|osteria|bistro|brasserie|steakhouse|asador|omakase|kaiseki|chef|tasting|degustaci(ó|o)n|alta\s*cocina|fine|gastronom|izakaya/i;
-const STREET_RE = /tacos?|birria|pastor|barbacoa|antojitos?|garnachas?|mariscos?|pozole|tlayuda|arepa|empanada/i;
+const STREET_HINT = /tacos?|birria|pastor|barbacoa|antojitos?|garnachas?|mariscos?|pozole|tlayuda|arepa|empanada/i;
 
 function cuisineSyn(term = "") {
   const t = term.toLowerCase();
@@ -186,14 +189,13 @@ function cuisineSyn(term = "") {
   if (/burger|hamburg/.test(t)) return { nameRe: "(burger|hamburg)", cuisineRe: "(burger|hamburg|american)" };
   return { nameRe: t ? t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") : "", cuisineRe: "" };
 }
-const wantsStreet = (c) => STREET_RE.test(String(c || ""));
 
 async function overpass({ lat, lon, radius, nameRe, cuisineRe, includeFastFood, dietFlag }) {
   const around = `around:${Math.max(700, Math.min(6000, radius))},${lat},${lon}`;
   const fast = includeFastFood ? "|fast_food" : "";
   const nameF = nameRe ? `["name"~"${nameRe}",i]` : "";
   const cuisineF = cuisineRe ? `["cuisine"~"${cuisineRe}",i]` : "";
-  const dietNodes = dietFlag ? `
+  const diet = dietFlag ? `
     node["diet:vegetarian"~"yes",i](${around});
     way ["diet:vegetarian"~"yes",i](${around});
     relation["diet:vegetarian"~"yes",i](${around});
@@ -204,13 +206,13 @@ async function overpass({ lat, lon, radius, nameRe, cuisineRe, includeFastFood, 
   const data = `
 [out:json][timeout:30];
 (
-  node["amenity"~"^(restaurant|cafe${fast})$"]${cuisineF}(${around});
-  way ["amenity"~"^(restaurant|cafe${fast})$"]${cuisineF}(${around});
-  relation["amenity"~"^(restaurant|cafe${fast})$"]${cuisineF}(${around});
-  node["amenity"~"^(restaurant|cafe${fast})$"]${nameF}(${around});
-  way ["amenity"~"^(restaurant|cafe${fast})$"]${nameF}(${around});
-  relation["amenity"~"^(restaurant|cafe${fast})$"]${nameF}(${around});
-  ${dietNodes}
+  node["amenity"~"^(restaurant${includeFastFood ? "|fast_food" : ""}|cafe)$"]${cuisineF}(${around});
+  way ["amenity"~"^(restaurant${includeFastFood ? "|fast_food" : ""}|cafe)$"]${cuisineF}(${around});
+  relation["amenity"~"^(restaurant${includeFastFood ? "|fast_food" : ""}|cafe)$"]${cuisineF}(${around});
+  node["amenity"~"^(restaurant${includeFastFood ? "|fast_food" : ""}|cafe)$"]${nameF}(${around});
+  way ["amenity"~"^(restaurant${includeFastFood ? "|fast_food" : ""}|cafe)$"]${nameF}(${around});
+  relation["amenity"~"^(restaurant${includeFastFood ? "|fast_food" : ""}|cafe)$"]${nameF}(${around});
+  ${diet}
 );
 out center tags 120;`;
   const r = await fetch("https://overpass-api.de/api/interpreter", {
@@ -239,8 +241,8 @@ function toPlace(e) {
     amenity: t.amenity || "",
     lat: center?.lat || null,
     lon: center?.lon || null,
-    hasContact: !!(t.website || t.phone || t["contact:website"] || t["contact:phone"]),
     tags: t,
+    hasContact: !!(t.website || t.phone || t["contact:website"] || t["contact:phone"]),
   };
 }
 function dedupe(arr) {
@@ -251,11 +253,29 @@ function dedupe(arr) {
     seen.add(k); return true;
   });
 }
-function score(p, wantStreet, wantCuisine) {
+
+function isChain(name, tags) {
+  if (!name) return false;
+  if (CHAIN_RE.some((re) => re.test(name))) return true;
+  if (tags.brand || tags["brand:wikidata"] || tags["brand:wikipedia"]) return true;
+  return false;
+}
+
+function wantsStreetFood(cuisine) {
+  return STREET_HINT.test(String(cuisine || ""));
+}
+
+// puntuación enfocada a calidad
+function scoreQuality(p, wantStreet, wantCuisine) {
+  if (!p.name) return -999;
+  if (isChain(p.name, p.tags || {})) return -999;
+
   let s = 0;
-  if (p.amenity === "restaurant") s += 1;
+  if (p.amenity === "restaurant") s += 3;
   if (p.cuisines.length) s += 2;
   if (p.hasContact) s += 2;
+  if (/wine|bar\s*a\s*vins|enoteca/i.test(p.name)) s += 1;
+
   if (wantCuisine) {
     const { cuisineRe, nameRe } = cuisineSyn(wantCuisine);
     const re = (cuisineRe || nameRe) ? new RegExp(cuisineRe || nameRe, "i") : null;
@@ -264,68 +284,71 @@ function score(p, wantStreet, wantCuisine) {
       if (p.cuisines.some(c => re.test(c))) s += 2;
     }
   }
-  if (FINE_RE.test(p.name)) s += 2;
-  if (wantStreet && p.amenity === "fast_food") s += 2;
-  if (CHAIN_RE.some(re => re.test(p.name)) || p.tags.brand || p.tags["brand:wikidata"]) s -= 4;
+  if (FINE_RE.test(p.name)) s += 3;
+
+  if (wantStreet) {
+    // Para street food permitimos fast_food pero exigimos que el nombre huela a taquería/puesto
+    if (p.amenity === "fast_food") s += /taco|taquer|birria|pastor|barbacoa/i.test(p.name) ? 2 : -2;
+  } else {
+    // si NO es street, penaliza fast_food
+    if (p.amenity === "fast_food") s -= 5;
+  }
   return s;
 }
+
 async function searchPlaces({ lat, lon, cuisine = "", zoneProvided = false }) {
   const { nameRe, cuisineRe, diet } = cuisineSyn(cuisine);
-  const includeFast = wantsStreet(cuisine);
-  let radius = zoneProvided ? 1500 : includeFast ? 2500 : 3500;
+  const wantStreet = wantsStreetFood(cuisine);
+  let radius = zoneProvided ? 1500 : wantStreet ? 2500 : 3500;
 
-  let el = await overpass({ lat, lon, radius, nameRe, cuisineRe, includeFastFood: includeFast, dietFlag: diet });
-  if (!el.length) { radius = Math.min(6000, radius + 2500);
-    el = await overpass({ lat, lon, radius, nameRe, cuisineRe, includeFastFood: includeFast, dietFlag: diet }); }
-  if (!el.length && nameRe) {
-    el = await overpass({ lat, lon, radius, nameRe, cuisineRe: "", includeFastFood: includeFast, dietFlag: diet }); }
-  if (!el.length) {
-    el = await overpass({ lat, lon, radius, nameRe: "", cuisineRe: "", includeFastFood: includeFast, dietFlag: false }); }
+  let els = await overpass({ lat, lon, radius, nameRe, cuisineRe, includeFastFood: wantStreet, dietFlag: diet });
+  if (!els.length) { radius = Math.min(6000, radius + 2500);
+    els = await overpass({ lat, lon, radius, nameRe, cuisineRe, includeFastFood: wantStreet, dietFlag: diet }); }
 
-  const places = dedupe(el.map(toPlace))
-    .map(p => ({ ...p, score: score(p, includeFast, cuisine) }))
-    .sort((a, b) => b.score - a.score);
+  const places = dedupe(els.map(toPlace))
+    .map(p => ({ ...p, _score: scoreQuality(p, wantStreet, cuisine) }))
+    .filter(p => p._score > 2) // umbral mínimo de calidad
+    .sort((a, b) => b._score - a._score);
 
-  return places.slice(0, 12);
+  return places.slice(0, 9);
 }
 
-// --------- Respuestas ---------
+// =============== Respuestas de conversación ===============
 function greet(lang) {
   return lang === "es"
-    ? "¡Hola! Soy Remy 👋 Puedo sugerirte lugares cerca de ti. ¿En qué ciudad estás?"
-    : "Hey! I'm Remy 👋 I can suggest great spots near you. Which city are you in?";
+    ? "¡Hola! Soy Remy 👋 Chef de cabecera y cazador de buenos lugares. ¿En qué ciudad estás y qué se te antoja?"
+    : "Hey! I'm Remy 👋 a chef-y guide to great spots. Which city are you in and what are you craving?";
 }
-function askOne(slot, lang) {
+function ask(slot, lang) {
   const es = lang === "es";
   const m = {
     city: es ? "¿En qué ciudad estás?" : "Which city are you in?",
-    zone: es ? "¿Alguna zona/colonia preferida?" : "Any area/neighborhood?",
     cuisine: es ? "¿Qué se te antoja?" : "What are you craving?",
+    zone: es ? "¿Alguna zona/colonia preferida?" : "Any preferred area/neighborhood?",
     budget: es ? "¿Presupuesto aproximado por persona?" : "Approx budget per person?",
   };
-  return m[slot] || (es ? "¿Cómo te ayudo?" : "How can I help?");
+  return m[slot];
 }
-function listMsg(results, lang, ctx) {
+function listMessage(items, lang, ctx) {
   const es = lang === "es";
-  const head = es ? `Aquí van algunas opciones${ctx ? ` en ${ctx}` : ""}:`
-                  : `Here are some options${ctx ? ` in ${ctx}` : ""}:`;
-  const body = results.slice(0, 3).map(p => {
+  const head = es ? `Te dejo opciones${ctx ? ` en ${ctx}` : ""}:` : `Here are some options${ctx ? ` in ${ctx}` : ""}:`;
+  const body = items.slice(0, 3).map(p => {
     const cuis = p.cuisines?.length ? ` (${p.cuisines.slice(0, 2).join(", ")})` : "";
     const addr = p.address ? ` — ${p.address}` : "";
     return `• ${p.name}${cuis}${addr}`;
   }).join("\n");
   return `${head}\n${body}`;
 }
-function gentleGuide(lang, city, cuisine) {
+function softNudge(lang, city, cuisine) {
   const es = lang === "es";
   if (es) {
-    return `Te dejo ideas rápidas${city ? ` en ${city}` : ""}${cuisine ? ` para ${cuisine}` : ""}:\n• Zonas con vida gastronómica (centro, barrios populares).\n• Menús cortos y buena rotación suelen ser aciertos.\n¿Afinamos por colonia o cambiamos de cocina?`;
+    return `Para darte algo top en ${city}${cuisine ? ` para ${cuisine}` : ""}, dime si tienes **zona** (p. ej. Roma/Condesa/Polanco) o si prefieres ajustar el antojo.`;
   }
-  return `Quick pointers${city ? ` in ${city}` : ""}${cuisine ? ` for ${cuisine}` : ""}:\n• Head to lively food districts.\n• Short menus with high turnover are usually great.\nWant me to narrow by area or switch cuisine?`;
+  return `To land something great in ${city}${cuisine ? ` for ${cuisine}` : ""}, tell me a **neighborhood** or tweak the craving.`;
 }
 
-// --------- API ---------
-app.get("/", (_, res) => res.send(`remy-ai-backend ${BUILD}`));
+// =============== API ===============
+app.get("/", (_, res) => res.send(`remy-chef ${BUILD}`));
 
 app.post("/recommendation", async (req, res) => {
   const {
@@ -336,102 +359,109 @@ app.post("/recommendation", async (req, res) => {
   } = req.body || {};
   if (!manychat_user_id) return res.status(400).json({ error: "manychat_user_id is required" });
 
+  const s = session(manychat_user_id);
   try {
-    const sess = getS(manychat_user_id);
-    sess.lang = keepLang(message || username, sess.lang);
+    // idioma del último mensaje
+    s.lang = useLang(s.lang, message || username);
 
-    // NLU + fallback regex
-    let slots = saveSlots(manychat_user_id, { ...sess.slots, city, zone, cuisine, budget, ...(bodySlots || {}) });
-    const nlu = await extractNLU(message, slots);
-
-    if (nlu.intent === "reset" || RESET_RE.test(message)) {
-      resetS(manychat_user_id);
+    // saludo si es inicio o inactividad
+    const idle = Date.now() - (s.lastMsgAt || 0) > SESSION_IDLE_MS;
+    const isHello = GREET_RE.test(message);
+    if ((idle || !s.greetedAt) && (isHello || !message || message.length < 4)) {
+      s.greetedAt = Date.now();
       return res.json({
-        reply: sess.lang === "es"
-          ? "Listo, reinicié la conversación. ¿En qué ciudad estás y qué se te antoja?"
-          : "Done, I reset our chat. Which city are you in and what are you craving?",
-        followup: askOne("city", sess.lang),
-        slots: getS(manychat_user_id).slots,
+        reply: greet(s.lang),
+        followup: ask("city", s.lang),
+        slots: s.slots,
         next_slot: "city",
       });
     }
 
-    // Saludo amable: responde y ya pide ciudad (sin forzar)
-    if (HELLO_RE.test(message) || nlu.intent === "chitchat") {
+    // reset
+    if (RESET_RE.test(message)) {
+      reset(manychat_user_id);
       return res.json({
-        reply: greet(sess.lang),
-        followup: askOne("city", sess.lang),
-        slots,
-        next_slot: "city"
+        reply: s.lang === "es"
+          ? "Listo, reinicié la conversación. ¿En qué ciudad estás y qué se te antoja?"
+          : "Done, I reset our chat. Which city are you in and what are you craving?",
+        followup: ask("city", s.lang),
+        slots: session(manychat_user_id).slots,
+        next_slot: "city",
       });
     }
 
-    if (nlu.updates) slots = saveSlots(manychat_user_id, nlu.updates);
+    // NLU
+    const slotsBefore = setSlots(manychat_user_id, { city, zone, cuisine, budget, ...(bodySlots || {}) });
+    const nlu = await extractNLU(message, slotsBefore);
+    if (nlu.updates) setSlots(manychat_user_id, nlu.updates);
+    const slots = session(manychat_user_id).slots;
 
-    // Si aún no hay ciudad: propone acción clara pero con tono amable
+    // si solo hay ciudad -> NO listar, pedir antojo
     if (!slots.city) {
       return res.json({
-        reply: sess.lang === "es"
-          ? "Para darte buenas sugerencias necesito tu ciudad."
-          : "To suggest great places I need your city.",
-        followup: askOne("city", sess.lang),
+        reply: s.lang === "es" ? "Para ayudarte bien, dime tu ciudad." : "To help properly, tell me your city.",
+        followup: ask("city", s.lang),
         slots, next_slot: "city"
       });
     }
 
-    // Geocodifica y busca
+    // si hay ciudad pero no cocina ni “sorpréndeme” -> NO listar, pedir cocina
+    if (!slots.cuisine && !WANT_SURPRISE_RE.test(message)) {
+      return res.json({
+        reply: s.lang === "es"
+          ? `Perfecto, ${slots.city}. ¿Qué se te antoja hoy?`
+          : `Great, ${slots.city}. What are you craving today?`,
+        followup: ask("cuisine", s.lang),
+        slots, next_slot: "cuisine"
+      });
+    }
+
+    // Geocodificación
     const pin = await geocodeCityZone(normalizeCity(slots.city), slots.zone);
     if (!pin?.lat || !pin?.lon) {
       return res.json({
-        reply: sess.lang === "es"
-          ? `No ubico bien ${slots.zone ? `${slots.zone}, ` : ""}${slots.city}.`
-          : `I couldn't locate ${slots.zone ? `${slots.zone}, ` : ""}${slots.city}.`,
-        followup: askOne("zone", sess.lang),
+        reply: s.lang === "es"
+          ? `No ubico bien ${slots.zone ? `${slots.zone}, ` : ""}${slots.city}. ¿Qué colonia te queda cómodo?`
+          : `I couldn't place ${slots.zone ? `${slots.zone}, ` : ""}${slots.city}. Which neighborhood works for you?`,
+        followup: ask("zone", s.lang),
         slots, next_slot: "zone"
       });
     }
 
+    // Búsqueda de calidad
     const results = await searchPlaces({
-      lat: parseFloat(pin.lat), lon: parseFloat(pin.lon),
-      cuisine: slots.cuisine, zoneProvided: !!slots.zone
+      lat: parseFloat(pin.lat),
+      lon: parseFloat(pin.lon),
+      cuisine: slots.cuisine,
+      zoneProvided: !!slots.zone
     });
 
-    if (results.length) {
-      const ctx = [slots.city, slots.zone].filter(Boolean).join(", ");
-      let ask = "";
-      if (!slots.cuisine && sess.lastAsked !== "cuisine") ask = askOne("cuisine", sess.lang);
-      else if (!slots.zone && sess.lastAsked !== "zone") ask = askOne("zone", sess.lang);
-      else if (!slots.budget && sess.lastAsked !== "budget") ask = askOne("budget", sess.lang);
-      sess.lastAsked = ask ? (ask.includes("zona") || ask.includes("area") ? "zone"
-                        : ask.includes("antoja") || ask.includes("craving") ? "cuisine"
-                        : ask.includes("Presupuesto") || ask.includes("budget") ? "budget" : "") : "";
-
+    // Si no hay resultados *de calidad*, no listamos basura: pedimos UNA precisión
+    if (!results.length) {
       return res.json({
-        reply: listMsg(results, sess.lang, ctx),
-        followup: ask,
-        slots,
-        next_slot: sess.lastAsked || ""
+        reply: softNudge(s.lang, slots.city, slots.cuisine),
+        followup: slots.zone ? ask("cuisine", s.lang) : ask("zone", s.lang),
+        slots, next_slot: slots.zone ? "cuisine" : "zone"
       });
     }
 
-    // Sin resultados: nunca “no encontré…”, da guía y 1 pregunta útil
-    const guide = gentleGuide(sess.lang, slots.city, slots.cuisine);
-    const ask = sess.lastAsked === "zone" ? askOne("cuisine", sess.lang)
-               : sess.lastAsked === "cuisine" ? askOne("zone", sess.lang)
-               : askOne("zone", sess.lang);
-    sess.lastAsked = ask.includes("zona") || ask.includes("area") ? "zone" : "cuisine";
+    // OK: listamos 2–3 lugares y pedimos UNA cosa para afinar
+    const ctx = [slots.city, slots.zone].filter(Boolean).join(", ");
+    let follow = "";
+    if (!slots.zone) follow = ask("zone", s.lang);
+    else if (!slots.budget) follow = ask("budget", s.lang);
+
     return res.json({
-      reply: guide,
-      followup: ask,
+      reply: listMessage(results, s.lang, ctx),
+      followup: follow,
       slots,
-      next_slot: sess.lastAsked
+      next_slot: follow ? (follow === ask("zone", s.lang) ? "zone" : "budget") : ""
     });
 
   } catch (err) {
     console.error(err);
-    const lang = getS(manychat_user_id)?.lang || guessLang(message);
     return res.status(500).json({
-      reply: lang === "es" ? "Tuve un problema técnico. Intentemos de nuevo." : "I hit a technical snag. Let's try again.",
+      reply: s.lang === "es" ? "Tuve un problema técnico. Probemos de nuevo." : "Technical hiccup. Let's try again.",
       followup: "",
       error: "internal_error"
     });
@@ -439,5 +469,4 @@ app.post("/recommendation", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Remy ${BUILD} listening on :${PORT}`));
-
+app.listen(PORT, () => console.log(`Remy Chef ${BUILD} listening on :${PORT}`));
