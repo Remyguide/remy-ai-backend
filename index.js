@@ -1,272 +1,228 @@
-// Remy — backend mínimo y lógico (v1)
-// - Sin dependencias de OpenAI (solo regex + OSM)
-// - Flujo: saluda una vez → pide ciudad → pide antojo → recomienda 2–3 opciones
-// - Responde en el idioma del usuario
 import express from "express";
 import cors from "cors";
-import dotenv from "dotenv";
-dotenv.config();
 
+// === (Opcional) OpenAI ===
+import OpenAI from "openai";
+
+// ---------- Config ----------
+const PORT = process.env.PORT || 3000;
+const USE_OPENAI = !!process.env.OPENAI_API_KEY;
+const openai = USE_OPENAI ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
+
+// Memoria simple por usuario (cámbialo a Redis en prod)
+const sessions = new Map();
+const TTL_MS = 1000 * 60 * 30; // 30 min
+
+function getSession(userId) {
+  const now = Date.now();
+  let s = sessions.get(userId);
+  if (!s || now - s.updatedAt > TTL_MS) {
+    s = {
+      history: [], // [{role:"user"|"assistant", content:string}]
+      slots: {
+        city: "",
+        zone: "",
+        cuisine: "",
+        budget: ""
+      },
+      pending_slot: "", // "city" | "zone" | "cuisine" | "budget" | ""
+      updatedAt: now
+    };
+    sessions.set(userId, s);
+  }
+  s.updatedAt = now;
+  return s;
+}
+
+// ---------- Utilidades ----------
+function safeStr(v) {
+  return (typeof v === "string" ? v : (v ?? "")).toString().trim();
+}
+
+// Extractores muy simples (mejorar con NER/RAG cuando gustes)
+function extractCity(text) {
+  const t = text.toLowerCase();
+  if (/\bcdmx\b|\bciudad de méxico\b/.test(t)) return "CDMX";
+  if (/\bguadalajara\b/.test(t)) return "Guadalajara";
+  if (/\bmonterrey\b/.test(t)) return "Monterrey";
+  return "";
+}
+
+function extractCuisine(text) {
+  const t = text.toLowerCase();
+  if (/\btamal(es)?\b/.test(t)) return "tamales";
+  if (/\btaco(s)?\b/.test(t)) return "tacos";
+  if (/\bsushi\b/.test(t)) return "sushi";
+  if (/\bpizza\b/.test(t)) return "pizza";
+  return "";
+}
+
+function extractZone(text) {
+  const t = text.toLowerCase();
+  if (/\broma\b/.test(t)) return "Roma";
+  if (/\bcondesa\b/.test(t)) return "Condesa";
+  if (/\bpolanco\b/.test(t)) return "Polanco";
+  if (/\bcentro\b/.test(t)) return "Centro";
+  return "";
+}
+
+function extractBudget(text) {
+  const t = text.toLowerCase();
+  // $, $$, $$$
+  if (/\$\$\$\$?/.test(t)) {
+    const match = t.match(/\$+/);
+    return match ? match[0] : "$$";
+  }
+  if (/barato|econ[oó]mico|barata/.test(t)) return "$";
+  if (/medio|normal/.test(t)) return "$$";
+  if (/caro|lujo|fine/.test(t)) return "$$$";
+  return "";
+}
+
+// Decide cuál slot falta
+function computeNextSlot(slots) {
+  if (!safeStr(slots.city)) return "city";
+  if (!safeStr(slots.cuisine)) return "cuisine";
+  // zona y presupuesto los pedimos después, no bloquean la primera respuesta
+  if (!safeStr(slots.zone)) return "zone";
+  if (!safeStr(slots.budget)) return "budget";
+  return "";
+}
+
+// Genera follow-up con base en next_slot
+function followupFor(nextSlot, slots) {
+  switch (nextSlot) {
+    case "city":
+      return "¿En qué ciudad estás?";
+    case "cuisine":
+      return "¿Qué se te antoja? (ej. tacos, tamales, sushi)";
+    case "zone":
+      return `¿Qué zona te queda mejor en ${slots.city}? (Roma, Condesa, Polanco, Centro…)`;
+    case "budget":
+      return "¿Tienes un presupuesto aproximado? (usa $, $$ o $$$)";
+    default:
+      return "";
+  }
+}
+
+// Respuesta dummy si no usas OpenAI (para pruebas)
+function ruleBasedReply(slots) {
+  const { city, zone, cuisine } = slots;
+  if (!city || !cuisine) {
+    const ask = followupFor(computeNextSlot(slots), slots);
+    return ask || "Cuéntame ciudad y antojo para empezar.";
+  }
+  // Mini repertorio de ejemplo
+  if (city === "CDMX" && cuisine === "tamales") {
+    const area = zone ? ` en ${zone}` : "";
+    return `Para **tamales** en CDMX${area}:\n• Tamales Doña Emi (Roma)\n• La Tamalería de la Abuela (Condesa)\n• Tamales Madre (Centro)\n¿Quieres que filtre por zona o presupuesto?`;
+  }
+  return `Ok, buscaré opciones de **${cuisine}** en **${city}**. ¿Te queda mejor Roma, Condesa o Polanco?`;
+}
+
+// ---------- Servidor ----------
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-/* -------------------- Sesiones muy simples -------------------- */
-const SESS = new Map();
-function sess(id) {
-  if (!SESS.has(id)) {
-    SESS.set(id, { lang: "es", city: "", zone: "", cuisine: "", budget: "", greeted: false, lastAt: 0 });
-  }
-  return SESS.get(id);
-}
-function resetSession(id) {
-  SESS.set(id, { lang: "es", city: "", zone: "", cuisine: "", budget: "", greeted: false, lastAt: 0 });
-}
+app.get("/health", (_req, res) => res.status(200).send("ok"));
 
-/* -------------------- Utilidades -------------------- */
-function detectLang(t = "") {
-  const s = (t || "").toLowerCase();
-  if (/[áéíóúñü¿¡]/.test(s)) return "es";
-  if (/(hola|buenas|ciudad|zona|antojo|presupuesto|cdmx|méxico|mexico)/i.test(s)) return "es";
-  return "en";
-}
-const RE = {
-  greet: /\b(hola|buenas|hello|hi|hey)\b/i,
-  reset: /(olvida|reinicia|empecemos de nuevo|borra|reset|start over)/i,
-  city1: /\b(?:estoy|ahora)\s+en\s+([a-záéíóúüñ .'-]+)$/i,
-  city2: /^\s*en\s+([a-záéíóúüñ .'-]+)\s*$/i,
-  city3: /\bin\s+([a-z .'-]+)\b/i,
-  zone: /(zona|colonia|barrio|neighbou?rhood|área)\s+(de\s+)?([a-záéíóúüñ .'-]+)$/i,
-  budget: /\$?\s?(\d{2,6})\s*(mxn|pesos|usd)?/i,
-};
-function pickCuisine(msg = "") {
-  const map = [
-    [/ramen|noodle/i, "ramen"],
-    [/sushi|omakase|izakaya/i, "sushi"],
-    [/pizza|trattoria|pasta|italian|italiana|osteria/i, "italiana"],
-    [/tacos?|pastor|birria|barbacoa|taquer/i, "tacos"],
-    [/veg(etari[ao]|an)|vegan/i, "vegetariana"],
-    [/mariscos?|sea ?food/i, "mariscos"],
-    [/burger|hamburg/i, "hamburguesa"],
-    [/mexican(a|o)|antojitos/i, "mexicana"],
-    [/japones(a)?/i, "japonesa"],
-  ];
-  for (const [r, v] of map) if (r.test(msg)) return v;
-  const m = msg.match(/(?:tengo\s+antojo\s+de|se\s+me\s+antoja|quiero|craving|i\s*want)\s+([a-záéíóúüñ .'-]+)/i);
-  return m ? m[1].trim() : "";
-}
-function extractSlots(msg = "", s) {
-  // ciudad
-  let city = "";
-  const m = msg.match(RE.city1) || msg.match(RE.city2) || null;
-  if (m) city = m[1].trim();
-  else {
-    const m3 = msg.match(RE.city3);
-    if (m3 && m3[1].length < 40) city = m3[1].trim();
-  }
-  // zona
-  let zone = "";
-  const z = msg.match(RE.zone);
-  if (z) zone = (z[3] || "").trim();
-  // antojo
-  const cuisine = pickCuisine(msg);
-  // presupuesto
-  const b = msg.match(RE.budget);
-  const budget = b ? b[1] : "";
-
-  return {
-    city: city || s.city,
-    zone: zone || s.zone,
-    cuisine: cuisine || s.cuisine,
-    budget: budget || s.budget,
-  };
-}
-function t(lang, key, vars = {}) {
-  const es = {
-    greet: "¡Hola! Soy Remy 👋 chef y cazador de buenos lugares. ¿En qué ciudad estás y qué se te antoja?",
-    ask_city: "Para ayudarte, dime en qué ciudad estás.",
-    ask_cuisine: (c) => `Perfecto, ${c}. ¿Qué se te antoja hoy? (ej. sushi, tacos, pizza, ramen)`,
-    ask_zone: "¿Alguna zona/colonia preferida?",
-    ask_budget: "¿Tienes un presupuesto aproximado por persona?",
-    refine: (c, cu) => `Para darte algo top en ${c}${cu ? ` para ${cu}` : ""}, dime una zona (p. ej. Roma/Condesa/Polanco) o ajusta el antojo.`,
-    list_head: (ctx) => `Te dejo opciones${ctx ? ` en ${ctx}` : ""}:`,
-    error_geo: (c, z) => `No ubico bien ${z ? `${z}, ` : ""}${c}. ¿Qué colonia te queda cómodo?`,
-    reset_ok: "Listo, reinicié la conversación. ¿En qué ciudad estás y qué se te antoja?",
-    hiccup: "Tuve un detalle técnico. Intentemos de nuevo.",
-  };
-  const en = {
-    greet: "Hey! I'm Remy 👋 a chef-y guide to great spots. Which city are you in and what are you craving?",
-    ask_city: "To help you, tell me which city you're in.",
-    ask_cuisine: (c) => `Great, ${c}. What are you craving today? (e.g., sushi, tacos, pizza, ramen)`,
-    ask_zone: "Any preferred neighborhood?",
-    ask_budget: "Do you have an approximate budget per person?",
-    refine: (c, cu) => `To land something great in ${c}${cu ? ` for ${cu}` : ""}, give me a neighborhood or tweak the craving.`,
-    list_head: (ctx) => `Here are some options${ctx ? ` in ${ctx}` : ""}:`,
-    error_geo: (c, z) => `I couldn't place ${z ? `${z}, ` : ""}${c}. Which neighborhood works?`,
-    reset_ok: "Done. I reset our chat. Which city are you in and what are you craving?",
-    hiccup: "I hit a hiccup. Let's try again.",
-  };
-  const pack = lang === "es" ? es : en;
-  const v = pack[key];
-  return typeof v === "function" ? v(...[].concat(vars)) : v;
-}
-
-/* -------------------- OSM (Nominatim + Overpass) -------------------- */
-const NOMINATIM_EMAIL = process.env.NOMINATIM_EMAIL || "remy@example.com";
-const UA = `Remy-Min/${NOMINATIM_EMAIL}`;
-async function geocode(q) {
-  const u = new URL("https://nominatim.openstreetmap.org/search");
-  u.searchParams.set("q", q);
-  u.searchParams.set("format", "jsonv2");
-  u.searchParams.set("addressdetails", "1");
-  u.searchParams.set("limit", "1");
-  u.searchParams.set("email", NOMINATIM_EMAIL);
-  const r = await fetch(u, { headers: { "User-Agent": UA } });
-  if (!r.ok) return null;
-  const arr = await r.json();
-  return arr?.[0] || null;
-}
-async function geoCityZone(city, zone) {
-  const g = await geocode(zone ? `${zone}, ${city}` : city);
-  return g && g.lat && g.lon ? g : null;
-}
-const CHAIN = [
-  /vips/i, /sanborns/i, /toks/i, /ihop/i, /subway/i, /kfc/i, /burger\s*king/i,
-  /domino/i, /little\s*caesars/i, /papa\s*john/i, /pizza\s*hutm?/i, /potzolcalli/i
-];
-function goodPlace(e, wantFastFood) {
-  const n = (e.tags?.name || "").toLowerCase();
-  if (!n) return false;
-  if (CHAIN.some((re) => re.test(n))) return false;
-  if (!wantFastFood && e.tags?.amenity === "fast_food") return false;
-  return true;
-}
-function toCard(e) {
-  const t = e.tags || {};
-  const addr = [
-    (t["addr:street"] || "") + (t["addr:housenumber"] ? ` ${t["addr:housenumber"]}` : ""),
-    t["addr:suburb"] || t["addr:neighbourhood"] || "",
-    t["addr:city"] || "",
-  ].filter(Boolean).join(", ");
-  return { name: t.name || "", cuisines: (t.cuisine || "").split(";").map(s=>s.trim()).filter(Boolean), address: addr };
-}
-async function overpassSearch(lat, lon, cuisine = "", radius = 3000) {
-  const wantFast = /(taco|pastor|birria|barbacoa|street\s*food)/i.test(cuisine);
-  const nameRe =
-    /ramen/i.test(cuisine) ? "(ramen|noodle|izakaya|japanese)" :
-    /sushi|omakase|izakaya/i.test(cuisine) ? "(sushi|izakaya|omakase)" :
-    /pizza|italian|italiana|trattoria|pasta|osteria/i.test(cuisine) ? "(pizza|trattoria|italian|pasta|osteria)" :
-    /taco|pastor|birria|barbacoa|taquer/i.test(cuisine) ? "(taco|taquer|pastor|birria|barbacoa)" :
-    "";
-  const around = `around:${Math.max(800, Math.min(5000, radius))},${lat},${lon}`;
-  const data = `
-[out:json][timeout:25];
-(
-  node["amenity"~"^(restaurant${wantFast?"|fast_food":""}|cafe)$"]${nameRe ? `["name"~"${nameRe}",i]`:""}(${around});
-  way ["amenity"~"^(restaurant${wantFast?"|fast_food":""}|cafe)$"]${nameRe ? `["name"~"${nameRe}",i]`:""}(${around});
-  relation["amenity"~"^(restaurant${wantFast?"|fast_food":""}|cafe)$"]${nameRe ? `["name"~"${nameRe}",i]`:""}(${around});
-);
-out center tags 80;`;
-  const r = await fetch("https://overpass-api.de/api/interpreter", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": UA },
-    body: new URLSearchParams({ data }).toString(),
-  });
-  if (!r.ok) return [];
-  const j = await r.json();
-  const arr = (j?.elements || []).filter((e) => goodPlace(e, wantFast)).map(toCard);
-
-  // puntaje chiquito: nombre + match cocina + dirección
-  return arr.map(p => {
-    let s = 0;
-    if (p.name) s += 2;
-    if (p.cuisines.length) s += 1;
-    if (p.address) s += 1;
-    if (nameRe && new RegExp(nameRe, "i").test(p.name)) s += 2;
-    return { ...p, _score: s };
-  }).sort((a,b)=>b._score-a._score).slice(0,3);
-}
-
-/* -------------------- Respuestas -------------------- */
-function listText(lang, items, ctx) {
-  const head = t(lang, "list_head", [ctx]);
-  const body = items.map(p=>{
-    const cs = p.cuisines?.length ? ` (${p.cuisines.slice(0,2).join(", ")})` : "";
-    const ad = p.address ? ` — ${p.address}` : "";
-    return `• ${p.name}${cs}${ad}`;
-  }).join("\n");
-  return `${head}\n${body}`;
-}
-
-/* -------------------- API -------------------- */
-app.get("/", (_, res)=>res.send("remy-min 1.0"));
-
+// Endpoint que configuraste en ManyChat: POST /recommendation
 app.post("/recommendation", async (req, res) => {
   try {
-    const { message = "", manychat_user_id = "", city="", cuisine="", zone="", budget="" } = req.body || {};
-    if (!manychat_user_id) return res.status(400).json({ error: "manychat_user_id is required" });
+    // === Entrada desde ManyChat (según tus capturas) ===
+    const {
+      message,              // "{{mensaje_usuario}}"
+      username,             // "{{contact.username}}"
+      manychat_user_id,     // "{{contact.id}}"
+      slots = {},           // { city, zone, cuisine, budget }
+      pending_slot          // "{{pending_slot}}"
+    } = req.body || {};
 
-    const S = sess(manychat_user_id);
-    // idioma por último mensaje
-    S.lang = detectLang(message) || S.lang;
+    const userId = safeStr(manychat_user_id) || safeStr(username) || "anon";
+    const text = safeStr(message);
 
-    // reset
-    if (RE.reset.test(message)) {
-      resetSession(manychat_user_id);
-      const S2 = sess(manychat_user_id);
-      return res.json({ reply: t(S2.lang,"reset_ok"), followup: t(S2.lang,"ask_city"), slots: { city:"", zone:"", cuisine:"", budget:"" }, next_slot: "city" });
+    const sess = getSession(userId);
+
+    // 1) merge de slots que vengan de ManyChat
+    sess.slots.city    = safeStr(slots.city)    || sess.slots.city;
+    sess.slots.zone    = safeStr(slots.zone)    || sess.slots.zone;
+    sess.slots.cuisine = safeStr(slots.cuisine) || sess.slots.cuisine;
+    sess.slots.budget  = safeStr(slots.budget)  || sess.slots.budget;
+
+    // 2) intenta extraer desde el texto libre
+    const cityFromText    = extractCity(text);
+    const cuisineFromText = extractCuisine(text);
+    const zoneFromText    = extractZone(text);
+    const budgetFromText  = extractBudget(text);
+
+    if (cityFromText && !sess.slots.city)       sess.slots.city = cityFromText;
+    if (cuisineFromText && !sess.slots.cuisine) sess.slots.cuisine = cuisineFromText;
+    if (zoneFromText && !sess.slots.zone)       sess.slots.zone = zoneFromText;
+    if (budgetFromText && !sess.slots.budget)   sess.slots.budget = budgetFromText;
+
+    // 3) guarda el turno del usuario
+    sess.history.push({ role: "user", content: text });
+
+    // 4) genera respuesta (OpenAI si hay API key; si no, reglas simples)
+    let replyText = "";
+    if (USE_OPENAI) {
+      const system = [
+        "Eres Remy, un concierge gastronómico en español.",
+        "Sé breve, concreto y útil.",
+        `Slots actuales: city=${sess.slots.city || "?"}, zone=${sess.slots.zone || "?"}, cuisine=${sess.slots.cuisine || "?"}, budget=${sess.slots.budget || "?"}.`,
+        "Si faltan city o cuisine, pide UNO a la vez. Si ya están, da 3-5 opciones y ofrece afinar por zona/presupuesto."
+      ].join("\n");
+
+      const messages = [
+        { role: "system", content: system },
+        ...sess.history.slice(-8), // últimas interacciones
+      ];
+
+      const completion = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        temperature: 0.5,
+        messages
+      });
+
+      replyText = completion.choices?.[0]?.message?.content?.trim() || "";
+    } else {
+      replyText = ruleBasedReply(sess.slots);
     }
 
-    // actualizar slots por body + mensaje
-    Object.assign(S, { city: city || S.city, cuisine: cuisine || S.cuisine, zone: zone || S.zone, budget: budget || S.budget });
-    Object.assign(S, extractSlots(message, S));
-    S.lastAt = Date.now();
+    // 5) decide siguiente slot pendiente
+    const nextSlot = computeNextSlot(sess.slots);
+    const followup = followupFor(nextSlot, sess.slots);
 
-    // saludo: solo si no está saludado y no hay ciudad/antojo
-    if (!S.greeted && RE.greet.test(message)) {
-      S.greeted = true;
-      return res.json({ reply: t(S.lang,"greet"), followup: t(S.lang,"ask_city"), slots: { city:S.city, zone:S.zone, cuisine:S.cuisine, budget:S.budget }, next_slot: "city" });
-    }
+    // 6) guarda respuesta del asistente en historial
+    sess.history.push({ role: "assistant", content: replyText });
 
-    // pedir ciudad
-    if (!S.city) {
-      return res.json({ reply: t(S.lang,"ask_city"), followup: t(S.lang,"ask_city"), slots: { city:"", zone:S.zone, cuisine:S.cuisine, budget:S.budget }, next_slot: "city" });
-    }
+    // 7) estructura EXACTA para ManyChat (como en tu mapeo)
+    const responsePayload = {
+      reply: replyText || (followup || "¿Me cuentas tu ciudad y antojo?"),
+      followup,
+      slots: {
+        city:    sess.slots.city,
+        zone:    sess.slots.zone,
+        cuisine: sess.slots.cuisine,
+        budget:  sess.slots.budget
+      },
+      next_slot: nextSlot
+    };
 
-    // pedir antojo
-    if (!S.cuisine) {
-      return res.json({ reply: t(S.lang,"ask_cuisine",[S.city]), followup: t(S.lang,"ask_cuisine",[S.city]), slots: { city:S.city, zone:S.zone, cuisine:"", budget:S.budget }, next_slot: "cuisine" });
-    }
-
-    // geocodificar
-    const pin = await geoCityZone(S.city, S.zone);
-    if (!pin) {
-      return res.json({ reply: t(S.lang,"error_geo",[S.city, S.zone]), followup: t(S.lang,"ask_zone"), slots: { city:S.city, zone:S.zone, cuisine:S.cuisine, budget:S.budget }, next_slot: "zone" });
-    }
-
-    const lat = parseFloat(pin.lat), lon = parseFloat(pin.lon);
-    let items = await overpassSearch(lat, lon, S.cuisine, S.zone ? 1500 : 3000);
-
-    if (!items.length) {
-      return res.json({ reply: t(S.lang,"refine",[S.city, S.cuisine]), followup: t(S.lang,"ask_zone"), slots: { city:S.city, zone:S.zone, cuisine:S.cuisine, budget:S.budget }, next_slot: "zone" });
-    }
-
-    const ctx = [S.city, S.zone].filter(Boolean).join(", ");
-    const follow = S.budget ? "" : t(S.lang,"ask_budget");
-
-    return res.json({
-      reply: listText(S.lang, items, ctx),
-      followup: follow,
-      slots: { city:S.city, zone:S.zone, cuisine:S.cuisine, budget:S.budget },
-      next_slot: follow ? "budget" : ""
+    return res.status(200).json(responsePayload);
+  } catch (err) {
+    console.error("Recommendation error:", err);
+    // Falla suave: ManyChat puede mapear reply aunque falle algo
+    return res.status(200).json({
+      reply: "Tuve un problema técnico, ¿puedes repetir tu última petición? 🙏",
+      followup: "",
+      slots: { city: "", zone: "", cuisine: "", budget: "" },
+      next_slot: ""
     });
-  } catch (e) {
-    console.error(e);
-    return res.status(500).json({ reply: "Ups, algo pasó. Intentemos otra vez.", followup: "", error: "internal_error" });
   }
 });
 
-/* -------------------- Start -------------------- */
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("Remy-min listening on :" + PORT));
-
+app.listen(PORT, () => {
+  console.log(`Remy backend listening on :${PORT}`);
+});
