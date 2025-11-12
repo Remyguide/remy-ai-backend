@@ -33,7 +33,8 @@ function sess(id) {
   return SESS.get(id);
 }
 function setSlots(s, upd = {}) {
-  const norm = (v) => (typeof v === "string" ? v.trim() : "");
+  const norm = (v) =>
+  (typeof v === "string" ? v.trim().replace(/^[\s,.;:!?]+|[\s,.;:!?]+$/g, "") : "");
   const next = { ...s.slots, ...upd };
   if (next.budget) {
     const m = String(next.budget).match(/\d{2,6}/);
@@ -57,6 +58,7 @@ function detectLang(text = "") {
   const t = text.toLowerCase();
   if (/[áéíóúñü¿¡]/.test(t)) return "es";
   if (/(hola|buenas|ciudad|zona|antojo|presupuesto|cdmx|méxico|mexico)/i.test(t)) return "es";
+  if (/(méxico|mexico|cdmx|ciudad\s+de\s+m[eé]xico)/i.test(t)) return "es";
   return "en";
 }
 
@@ -66,8 +68,10 @@ const RE = {
   reset: /(olvida|reinicia|reset|empecemos de nuevo)/i,
   surprise: /(sorpr[eé]ndeme|recom[ií]endame|what you suggest|surprise me)/i,
 
-  newCity:
-    /(estoy|and(o)?|ahora)\s+en\s+([a-záéíóúüñ .'-]{2,})$|(?:ir[ée]?\s+a|voy\s+a|mañana\s+(voy|estar[eé])\s+en|on\s+(?:fri|sat|sun|mon|tue|wed|thu)[^\w]*\s*i'?m\s+going\s+to|i'?m\s+in)\s+([a-zA-Záéíóúüñ .'-]{2,})/i,
+  // nueva ciudad (ES/EN, permite texto después)
+newCity:
+  /(estoy|and(o)?|ahora)\s+en\s+([a-záéíóúüñ .'-]{2,})|(?:ir[ée]?\s+a|voy\s+a|mañana\s+(voy|estar[eé])\s+en|on\s+(?:fri|sat|sun|mon|tue|wed|thu)[^\w]*\s*i'?m\s+going\s+to|i'?m\s+in)\s+([a-zA-Záéíóúüñ .'-]{2,})/i,
+
 
   citySolo: /^(en|in)\s+([a-zA-Záéíóúüñ .'-]{2,})$/i,
   zone: /(zona|colonia|barrio|neighbou?rhood|area)\s+([a-zA-Záéíóúüñ .'-]{2,})/i,
@@ -126,6 +130,7 @@ const UA = `RemyChef/${BUILD} (${NOMINATIM_EMAIL})`;
 
 function normCity(c = "") {
   const s = c.toLowerCase().trim();
+  if (/(méxico|mexico)\s+city/.test(s)) return "Ciudad de México";
   if (!s) return "";
   if (/^(mx|méxico|mexico)$/.test(s)) return "Ciudad de México";
   if (/^(cdmx|ciudad de mexico|mexico city)$/.test(s)) return "Ciudad de México";
