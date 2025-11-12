@@ -9,6 +9,7 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import { findTopByPrestige } from "./db.js"; // ⬅️ Usa tu base canónica primero
 
 dotenv.config();
 const app = express();
@@ -25,7 +26,7 @@ function sess(id) {
       lang: "es",
       slots: { city: "", zone: "", cuisine: "", budget: "" },
       lastIntent: "",
-      lastResults: [], // últimos lugares mostrados (para fotos / qué pedir)
+      lastResults: [],
       updatedAt: Date.now(),
     });
   }
@@ -65,16 +66,13 @@ const RE = {
   reset: /(olvida|reinicia|reset|empecemos de nuevo)/i,
   surprise: /(sorpr[eé]ndeme|recom[ií]endame|what you suggest|surprise me)/i,
 
-  // nueva ciudad (ES/EN, futuro incluido)
   newCity:
     /(estoy|and(o)?|ahora)\s+en\s+([a-záéíóúüñ .'-]{2,})$|(?:ir[ée]?\s+a|voy\s+a|mañana\s+(voy|estar[eé])\s+en|on\s+(?:fri|sat|sun|mon|tue|wed|thu)[^\w]*\s*i'?m\s+going\s+to|i'?m\s+in)\s+([a-zA-Záéíóúüñ .'-]{2,})/i,
 
-  // slot a pelo
   citySolo: /^(en|in)\s+([a-zA-Záéíóúüñ .'-]{2,})$/i,
   zone: /(zona|colonia|barrio|neighbou?rhood|area)\s+([a-zA-Záéíóúüñ .'-]{2,})/i,
   budget: /(\$|USD|MXN|EUR|euros|pesos|d[oó]lares|dlls)\s*([0-9]{2,6})/i,
 
-  // cocina
   cuisineMap: [
     { re: /(ramen|noodle)/i, v: "ramen" },
     { re: /(sushi|omakase|izakaya)/i, v: "sushi" },
@@ -91,10 +89,8 @@ const RE = {
     { re: /(street\s*food|comida\s*callejera)/i, v: "street food" },
   ],
 
-  // fotos / menú
   photos: /(foto|fotos|picture|pictures|pics|photos|imagen|im[aá]genes|men[uú])/i,
 
-  // qué pedir en X
   dishAt: /(qué\s+(?:platillos?|p(e|é)dir|recomiendas?)\s+en\s+([a-zA-Záéíóúüñ .'-]{2,}))|(?:what\s+(?:should|to)\s+order\s+at\s+([a-zA-Z .'-]{2,}))/i,
 };
 
@@ -288,6 +284,25 @@ async function searchPlaces({ lat, lon, cuisine = "", zoneProvided = false }) {
 }
 
 // -------------------- Mensajes --------------------
+// Badges bonitos (★ Michelin, 50Best, La Liste, 🌿 Green)
+function formatBadges(p) {
+  const t = p.tags || {};
+  // t.michelin viene como "score" 45..100; lo mapeamos a etiquetas
+  let mic = "";
+  if (typeof t.michelin === "number") {
+    if (t.michelin >= 100) mic = "★★★";
+    else if (t.michelin >= 85) mic = "★★";
+    else if (t.michelin >= 70) mic = "★";
+    else if (t.michelin >= 55) mic = "Bib";
+    else if (t.michelin >= 45) mic = "Sel";
+  }
+  const b50 = typeof t.best50 === "number" ? "50Best" : "";
+  const la  = typeof t.laliste === "number" ? `${Math.round(t.laliste)} LaListe` : "";
+  const g   = t.greenstar ? "🌿" : "";
+  const parts = [mic, b50, la, g].filter(Boolean);
+  return parts.length ? `[${parts.join(" · ")}] ` : "";
+}
+
 function greet(lang) {
   return lang === "es"
     ? "¡Hola! Soy Remy 👋 chef de cabecera y cazador de buenos lugares. ¿En qué ciudad estás y qué se te antoja?"
@@ -308,9 +323,10 @@ function listMsg(items, lang, ctx) {
   const es = lang === "es";
   const head = es ? `Te dejo opciones${ctx ? ` en ${ctx}` : ""}:` : `Here are some options${ctx ? ` in ${ctx}` : ""}:`;
   const body = items.slice(0, 3).map(p => {
+    const badges = formatBadges(p); // ⬅️ añadido
     const cuis = p.cuisines?.length ? ` (${p.cuisines.slice(0, 2).join(", ")})` : "";
     const addr = p.address ? ` — ${p.address}` : "";
-    return `• ${p.name}${cuis}${addr}`;
+    return `• ${badges}${p.name}${cuis}${addr}`;
   }).join("\n");
   return `${head}\n${body}`;
 }
@@ -360,19 +376,12 @@ function dishAdviceByCuisine(cuis, lang) {
 
 // -------------------- INTENT ROUTER --------------------
 function intentRouter(msg) {
-  // 1) RESET
   if (RE.reset.test(msg)) return "reset";
-  // 2) NEW CITY
   if (RE.newCity.test(msg) || RE.citySolo.test(msg)) return "new_city";
-  // 3) PHOTOS
   if (RE.photos.test(msg)) return "photo_request";
-  // 4) DISH AT PLACE
   if (RE.dishAt.test(msg)) return "dish_at_place";
-  // 5) RECOMMEND (sorpréndeme o dice antojo)
   if (RE.surprise.test(msg) || pickCuisine(msg)) return "recommend";
-  // 6) UPDATE SLOT (zona/presupuesto)
   if (RE.zone.test(msg) || RE.budget.test(msg)) return "update_slot";
-  // 7) CHITCHAT
   if (RE.greet.test(msg)) return "chitchat";
   return "unknown";
 }
@@ -392,8 +401,6 @@ app.post("/recommendation", async (req, res) => {
 
   const s = sess(manychat_user_id);
   s.lang = detectLang(message || username);
-
-  // merge slots del body
   setSlots(s, { ...incomingSlots, city, zone, cuisine, budget });
 
   const intent = intentRouter(message);
@@ -411,7 +418,7 @@ app.post("/recommendation", async (req, res) => {
     });
   }
 
-  // INTENT: new city → recomienda ya con info parcial
+  // INTENT: new city
   if (intent === "new_city" && s.slots.city) {
     const pin = await geocodeCityZone(normCity(s.slots.city), s.slots.zone);
     if (!pin?.lat || !pin?.lon) {
@@ -424,43 +431,46 @@ app.post("/recommendation", async (req, res) => {
         next_slot: "zone"
       });
     }
-    const results = await searchPlaces({
-      lat: parseFloat(pin.lat),
-      lon: parseFloat(pin.lon),
-      cuisine: s.slots.cuisine,
-      zoneProvided: !!s.slots.zone
+    // Base canónica primero
+    const canonical = findTopByPrestige({
+      lat: parseFloat(pin.lat), lon: parseFloat(pin.lon),
+      radiusKm: s.slots.zone ? 3 : 7,
+      cuisine: s.slots.cuisine || "", limit: 9
     });
+    if (canonical && canonical.length >= 3) {
+      s.lastResults = canonical.map(r => ({
+        id: "db/" + r.id,
+        name: r.name,
+        cuisines: (r.cuisine || "").split(",").map(x => x.trim()).filter(Boolean),
+        address: r.address || [s.slots.city, s.slots.zone].filter(Boolean).join(", "),
+        amenity: "restaurant",
+        lat: r.lat, lon: r.lng,
+        tags: { michelin: r.michelin_score, best50: r.best50_score, laliste: r.laliste_score, greenstar: r.greenstar }
+      }));
+      const ctx = [s.slots.city, s.slots.zone].filter(Boolean).join(", ");
+      const follow = s.slots.cuisine ? (s.slots.budget ? "" : ask("budget", s.lang)) : ask("cuisine", s.lang);
+      return res.json({ reply: listMsg(s.lastResults, s.lang, ctx), followup: follow, slots: s.slots, next_slot: follow ? (follow === ask("cuisine", s.lang) ? "cuisine" : "budget") : "" });
+    }
+    // Fallback Overpass
+    const results = await searchPlaces({ lat: parseFloat(pin.lat), lon: parseFloat(pin.lon), cuisine: s.slots.cuisine, zoneProvided: !!s.slots.zone });
     s.lastResults = results;
-
     if (!results.length) {
-      return res.json({
-        reply: softNudge(s.lang, s.slots.city, s.slots.cuisine),
-        followup: s.slots.zone ? ask("cuisine", s.lang) : ask("zone", s.lang),
-        slots: s.slots,
-        next_slot: s.slots.zone ? "cuisine" : "zone"
-      });
+      return res.json({ reply: softNudge(s.lang, s.slots.city, s.slots.cuisine), followup: s.slots.zone ? ask("cuisine", s.lang) : ask("zone", s.lang), slots: s.slots, next_slot: s.slots.zone ? "cuisine" : "zone" });
     }
     const ctx = [s.slots.city, s.slots.zone].filter(Boolean).join(", ");
     const follow = s.slots.cuisine ? (s.slots.budget ? "" : ask("budget", s.lang)) : ask("cuisine", s.lang);
-    return res.json({
-      reply: listMsg(results, s.lang, ctx),
-      followup: follow,
-      slots: s.slots,
-      next_slot: follow ? (follow === ask("cuisine", s.lang) ? "cuisine" : "budget") : ""
-    });
+    return res.json({ reply: listMsg(results, s.lang, ctx), followup: follow, slots: s.slots, next_slot: follow ? (follow === ask("cuisine", s.lang) ? "cuisine" : "budget") : "" });
   }
 
   // INTENT: photo request
   if (intent === "photo_request") {
-    // Si el usuario mencionó un lugar explícito dentro del mensaje, úsalo; de lo contrario, usa el primero de lastResults o pide cuál
     const nameFromMsg =
       (message.match(/en\s+([a-zA-Záéíóúüñ .'-]{2,})$/i)?.[1]) ||
       (message.match(/at\s+([a-zA-Z .'-]{2,})$/i)?.[1]) || "";
     if (nameFromMsg) {
       const p = (s.lastResults || []).find(r => r.name && new RegExp(nameFromMsg, "i").test(r.name));
-      const text = p
-        ? photoLinks(`${p.name} ${s.slots.city || ""}`, p.lat, p.lon, s.lang)
-        : photoLinks(`${nameFromMsg} ${s.slots.city || ""}`, null, null, s.lang);
+      const text = p ? photoLinks(`${p.name} ${s.slots.city || ""}`, p.lat, p.lon, s.lang)
+                     : photoLinks(`${nameFromMsg} ${s.slots.city || ""}`, null, null, s.lang);
       return res.json({ reply: text, followup: "", slots: s.slots, next_slot: "" });
     }
     if (s.lastResults?.length) {
@@ -468,12 +478,7 @@ app.post("/recommendation", async (req, res) => {
       const text = photoLinks(`${p.name} ${s.slots.city || ""}`, p.lat, p.lon, s.lang);
       return res.json({ reply: text, followup: "", slots: s.slots, next_slot: "" });
     }
-    return res.json({
-      reply: s.lang === "es" ? "¿De qué lugar quieres ver fotos?" : "Which place do you want photos of?",
-      followup: ask("whichPlace", s.lang),
-      slots: s.slots,
-      next_slot: "whichPlace"
-    });
+    return res.json({ reply: s.lang === "es" ? "¿De qué lugar quieres ver fotos?" : "Which place do you want photos of?", followup: ask("whichPlace", s.lang), slots: s.slots, next_slot: "whichPlace" });
   }
 
   // INTENT: qué pedir en X
@@ -481,13 +486,8 @@ app.post("/recommendation", async (req, res) => {
     const m = message.match(RE.dishAt);
     const placeName = (m?.[3] || m?.[4] || "").trim();
     if (!placeName) {
-      return res.json({
-        reply: s.lang === "es" ? "¿En qué lugar? Te digo qué pedir ;)" : "At which place? I’ll tell you what to order ;)",
-        followup: "",
-        slots: s.slots, next_slot: ""
-      });
+      return res.json({ reply: s.lang === "es" ? "¿En qué lugar? Te digo qué pedir ;)" : "At which place? I’ll tell you what to order ;)", followup: "", slots: s.slots, next_slot: "" });
     }
-    // Busca en lastResults, si no, responde por cocina genérica
     const p = (s.lastResults || []).find(r => new RegExp(placeName, "i").test(r.name || ""));
     const advice = p ? dishAdviceByCuisine(p.cuisines, s.lang) : dishAdviceByCuisine([], s.lang);
     const reply = s.lang === "es"
@@ -496,118 +496,96 @@ app.post("/recommendation", async (req, res) => {
     return res.json({ reply, followup: "", slots: s.slots, next_slot: "" });
   }
 
-  // INTENT: recommend (incluye “sorpréndeme” o ya hay cocina)
+  // INTENT: recommend
   if (intent === "recommend") {
     if (!s.slots.city) {
-      return res.json({
-        reply: s.lang === "es" ? "¿En qué ciudad estás? Te recomiendo algo bueno." : "Which city are you in? I’ll suggest something good.",
-        followup: ask("city", s.lang),
-        slots: s.slots, next_slot: "city"
-      });
+      return res.json({ reply: s.lang === "es" ? "¿En qué ciudad estás? Te recomiendo algo bueno." : "Which city are you in? I’ll suggest something good.", followup: ask("city", s.lang), slots: s.slots, next_slot: "city" });
     }
     const pin = await geocodeCityZone(normCity(s.slots.city), s.slots.zone);
     if (!pin?.lat || !pin?.lon) {
-      return res.json({
-        reply: s.lang === "es" ? `Para ubicarte en ${s.slots.city}, ¿alguna zona/colonia?` : `To place you in ${s.slots.city}, any neighborhood?`,
-        followup: ask("zone", s.lang),
-        slots: s.slots, next_slot: "zone"
-      });
+      return res.json({ reply: s.lang === "es" ? `Para ubicarte en ${s.slots.city}, ¿alguna zona/colonia?` : `To place you in ${s.slots.city}, any neighborhood?`, followup: ask("zone", s.lang), slots: s.slots, next_slot: "zone" });
     }
-    const results = await searchPlaces({
-      lat: parseFloat(pin.lat),
-      lon: parseFloat(pin.lon),
-      cuisine: s.slots.cuisine,
-      zoneProvided: !!s.slots.zone
-    });
+    const canonical = findTopByPrestige({ lat: parseFloat(pin.lat), lon: parseFloat(pin.lon), radiusKm: s.slots.zone ? 3 : 7, cuisine: s.slots.cuisine || "", limit: 9 });
+    if (canonical && canonical.length >= 3) {
+      s.lastResults = canonical.map(r => ({
+        id: "db/" + r.id, name: r.name,
+        cuisines: (r.cuisine || "").split(",").map(x => x.trim()).filter(Boolean),
+        address: r.address || [s.slots.city, s.slots.zone].filter(Boolean).join(", "),
+        amenity: "restaurant", lat: r.lat, lon: r.lng,
+        tags: { michelin: r.michelin_score, best50: r.best50_score, laliste: r.laliste_score, greenstar: r.greenstar }
+      }));
+      const ctx = [s.slots.city, s.slots.zone].filter(Boolean).join(", ");
+      const follow = s.slots.cuisine ? (s.slots.budget ? "" : ask("budget", s.lang)) : ask("cuisine", s.lang);
+      return res.json({ reply: listMsg(s.lastResults, s.lang, ctx), followup: follow, slots: s.slots, next_slot: follow ? (follow === ask("cuisine", s.lang) ? "cuisine" : "budget") : "" });
+    }
+    const results = await searchPlaces({ lat: parseFloat(pin.lat), lon: parseFloat(pin.lon), cuisine: s.slots.cuisine, zoneProvided: !!s.slots.zone });
     s.lastResults = results;
-
     if (!results.length) {
-      return res.json({
-        reply: softNudge(s.lang, s.slots.city, s.slots.cuisine),
-        followup: s.slots.zone ? ask("cuisine", s.lang) : ask("zone", s.lang),
-        slots: s.slots, next_slot: s.slots.zone ? "cuisine" : "zone"
-      });
+      return res.json({ reply: softNudge(s.lang, s.slots.city, s.slots.cuisine), followup: s.slots.zone ? ask("cuisine", s.lang) : ask("zone", s.lang), slots: s.slots, next_slot: s.slots.zone ? "cuisine" : "zone" });
     }
     const ctx = [s.slots.city, s.slots.zone].filter(Boolean).join(", ");
     const follow = s.slots.cuisine ? (s.slots.budget ? "" : ask("budget", s.lang)) : ask("cuisine", s.lang);
-    return res.json({
-      reply: listMsg(results, s.lang, ctx),
-      followup: follow,
-      slots: s.slots,
-      next_slot: follow ? (follow === ask("cuisine", s.lang) ? "cuisine" : "budget") : ""
-    });
+    return res.json({ reply: listMsg(results, s.lang, ctx), followup: follow, slots: s.slots, next_slot: follow ? (follow === ask("cuisine", s.lang) ? "cuisine" : "budget") : "" });
   }
 
-  // INTENT: update slot (zona o presupuesto) → si ya hay city, recomienda; si no, pide ciudad
+  // INTENT: update slot
   if (intent === "update_slot") {
     if (!s.slots.city) {
-      return res.json({
-        reply: s.lang === "es" ? "Perfecto. ¿En qué ciudad estás?" : "Great. Which city are you in?",
-        followup: ask("city", s.lang), slots: s.slots, next_slot: "city"
-      });
+      return res.json({ reply: s.lang === "es" ? "Perfecto. ¿En qué ciudad estás?" : "Great. Which city are you in?", followup: ask("city", s.lang), slots: s.slots, next_slot: "city" });
     }
     const pin = await geocodeCityZone(normCity(s.slots.city), s.slots.zone);
     if (!pin?.lat || !pin?.lon) {
-      return res.json({
-        reply: s.lang === "es" ? `Para ubicarte en ${s.slots.city}, ¿qué zona?` : `To place you in ${s.slots.city}, which area?`,
-        followup: ask("zone", s.lang), slots: s.slots, next_slot: "zone"
-      });
+      return res.json({ reply: s.lang === "es" ? `Para ubicarte en ${s.slots.city}, ¿qué zona?` : `To place you in ${s.slots.city}, which area?`, followup: ask("zone", s.lang), slots: s.slots, next_slot: "zone" });
     }
-    const results = await searchPlaces({
-      lat: parseFloat(pin.lat),
-      lon: parseFloat(pin.lon),
-      cuisine: s.slots.cuisine,
-      zoneProvided: !!s.slots.zone
-    });
+    const canonical = findTopByPrestige({ lat: parseFloat(pin.lat), lon: parseFloat(pin.lon), radiusKm: s.slots.zone ? 3 : 7, cuisine: s.slots.cuisine || "", limit: 9 });
+    if (canonical && canonical.length >= 3) {
+      s.lastResults = canonical.map(r => ({
+        id: "db/" + r.id, name: r.name,
+        cuisines: (r.cuisine || "").split(",").map(x => x.trim()).filter(Boolean),
+        address: r.address || [s.slots.city, s.slots.zone].filter(Boolean).join(", "),
+        amenity: "restaurant", lat: r.lat, lon: r.lng,
+        tags: { michelin: r.michelin_score, best50: r.best50_score, laliste: r.laliste_score, greenstar: r.greenstar }
+      }));
+      const ctx = [s.slots.city, s.slots.zone].filter(Boolean).join(", ");
+      return res.json({ reply: listMsg(s.lastResults, s.lang, ctx), followup: s.slots.budget ? "" : ask("budget", s.lang), slots: s.slots, next_slot: s.slots.budget ? "" : "budget" });
+    }
+    const results = await searchPlaces({ lat: parseFloat(pin.lat), lon: parseFloat(pin.lon), cuisine: s.slots.cuisine, zoneProvided: !!s.slots.zone });
     s.lastResults = results;
     if (!results.length) {
-      return res.json({
-        reply: softNudge(s.lang, s.slots.city, s.slots.cuisine),
-        followup: s.slots.zone ? ask("cuisine", s.lang) : ask("zone", s.lang),
-        slots: s.slots, next_slot: s.slots.zone ? "cuisine" : "zone"
-      });
+      return res.json({ reply: softNudge(s.lang, s.slots.city, s.slots.cuisine), followup: s.slots.zone ? ask("cuisine", s.lang) : ask("zone", s.lang), slots: s.slots, next_slot: s.slots.zone ? "cuisine" : "zone" });
     }
     const ctx = [s.slots.city, s.slots.zone].filter(Boolean).join(", ");
-    return res.json({
-      reply: listMsg(results, s.lang, ctx),
-      followup: s.slots.budget ? "" : ask("budget", s.lang),
-      slots: s.slots, next_slot: s.slots.budget ? "" : "budget"
-    });
+    return res.json({ reply: listMsg(results, s.lang, ctx), followup: s.slots.budget ? "" : ask("budget", s.lang), slots: s.slots, next_slot: s.slots.budget ? "" : "budget" });
   }
 
-  // INTENT: chitchat o desconocido → saluda y mueve
+  // CHITCHAT / fallback con ciudad
   if (!s.slots.city) {
-    return res.json({
-      reply: greet(s.lang),
-      followup: ask("city", s.lang),
-      slots: s.slots, next_slot: "city"
-    });
+    return res.json({ reply: greet(s.lang), followup: ask("city", s.lang), slots: s.slots, next_slot: "city" });
   }
-  // con ciudad pero sin antojo → da algo rápido y pregunta 1 cosa
   const pin = await geocodeCityZone(normCity(s.slots.city), s.slots.zone);
   if (pin?.lat && pin?.lon) {
-    const results = await searchPlaces({
-      lat: parseFloat(pin.lat),
-      lon: parseFloat(pin.lon),
-      cuisine: s.slots.cuisine,
-      zoneProvided: !!s.slots.zone
-    });
+    const canonical = findTopByPrestige({ lat: parseFloat(pin.lat), lon: parseFloat(pin.lon), radiusKm: s.slots.zone ? 3 : 7, cuisine: s.slots.cuisine || "", limit: 9 });
+    if (canonical && canonical.length >= 3) {
+      s.lastResults = canonical.map(r => ({
+        id: "db/" + r.id, name: r.name,
+        cuisines: (r.cuisine || "").split(",").map(x => x.trim()).filter(Boolean),
+        address: r.address || [s.slots.city, s.slots.zone].filter(Boolean).join(", "),
+        amenity: "restaurant", lat: r.lat, lon: r.lng,
+        tags: { michelin: r.michelin_score, best50: r.best50_score, laliste: r.laliste_score, greenstar: r.greenstar }
+      }));
+      const ctx = [s.slots.city, s.slots.zone].filter(Boolean).join(", ");
+      const follow = s.slots.cuisine ? ask("budget", s.lang) : ask("cuisine", s.lang);
+      return res.json({ reply: listMsg(s.lastResults, s.lang, ctx), followup: follow, slots: s.slots, next_slot: follow === ask("cuisine", s.lang) ? "cuisine" : "budget" });
+    }
+    const results = await searchPlaces({ lat: parseFloat(pin.lat), lon: parseFloat(pin.lon), cuisine: s.slots.cuisine, zoneProvided: !!s.slots.zone });
     s.lastResults = results;
     if (results.length) {
       const ctx = [s.slots.city, s.slots.zone].filter(Boolean).join(", ");
       const follow = s.slots.cuisine ? ask("budget", s.lang) : ask("cuisine", s.lang);
-      return res.json({
-        reply: listMsg(results, s.lang, ctx),
-        followup: follow, slots: s.slots,
-        next_slot: follow === ask("cuisine", s.lang) ? "cuisine" : "budget"
-      });
+      return res.json({ reply: listMsg(results, s.lang, ctx), followup: follow, slots: s.slots, next_slot: follow === ask("cuisine", s.lang) ? "cuisine" : "budget" });
     }
   }
-  return res.json({
-    reply: softNudge(s.lang, s.slots.city, s.slots.cuisine),
-    followup: s.slots.zone ? ask("cuisine", s.lang) : ask("zone", s.lang),
-    slots: s.slots, next_slot: s.slots.zone ? "cuisine" : "zone"
-  });
+  return res.json({ reply: softNudge(s.lang, s.slots.city, s.slots.cuisine), followup: s.slots.zone ? ask("cuisine", s.lang) : ask("zone", s.lang), slots: s.slots, next_slot: s.slots.zone ? "cuisine" : "zone" });
 });
 
 const PORT = process.env.PORT || 3000;
